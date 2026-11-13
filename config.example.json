@@ -1,0 +1,20 @@
+{
+  "allowed_senders": ["+1 555 555 0123"],
+  "gv_number": "+1 555 555 0100",
+  "google_account_email": "you@example.com",
+  "reply_from_email": "you@example.com",
+  "gmail_account_index": 0,
+  "gv_account_index": 0,
+  "chrome_app": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+  "chrome_profile": "Default",
+  "claude_path": "~/.local/bin/claude",
+  "claude_cwd": "~",
+  "model": "opus",
+  "effort": "high",
+  "permission_mode": "auto",
+  "fallback_agy_path": null,
+  "poll_seconds": 4,
+  "settle_seconds": 5,
+  "job_timeout_seconds": 3600,
+  "system_prompt_extra": ""
+}

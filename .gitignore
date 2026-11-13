@@ -1,0 +1,8 @@
+config.json
+state.json
+*.log
+nohup.out
+outbox/
+__pycache__/
+.DS_Store
+restart.flag
