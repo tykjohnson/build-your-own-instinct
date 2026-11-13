@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
-"""Text Claude Code from your phone through Google Voice.
+"""Text your coding agent (Claude Code by default, or Codex) from your phone through Google Voice.
 
 Flow: you text your Google Voice number. Google Voice forwards the text to your Gmail
 inbox. This script reads that inbox through a dedicated tab in your logged-in Chrome
-(JXA -> JavaScript in the tab), runs `claude -p` in a resumed session, and replies through
-the Google Voice web app. If that fails it replies to the Google Voice email instead,
-which Google Voice delivers back as a text in the same thread.
+(JXA -> JavaScript in the tab), runs the agent CLI (`claude -p`, `codex exec`, or any
+command you set) in a resumed session, and replies through the Google Voice web app. If
+that fails it replies to the Google Voice email instead, which Google Voice delivers back
+as a text in the same thread.
 
 All personal values (phone numbers, account email, paths, model) live in config.json,
-next to this file. Copy config.example.json to config.json and fill it in.
+next to this file. Create it with `python3 watcher.py --init ...` (see README).
+
+  python3 watcher.py --init --phone ... --gv-number ... --email ...   write config.json
+  python3 watcher.py --check     check config, agent CLI and Chrome (no texts sent)
+  python3 watcher.py --start     launch run.sh in its own Terminal window
+  python3 watcher.py --prime     mark existing texts as seen (also done on first run)
+  python3 watcher.py             run the watcher (run.sh does this and restarts it)
 """
 import json, os, re, subprocess, sys, time, html, datetime, pathlib, threading, queue, signal, hashlib
+import shlex, shutil, tempfile, argparse
 
 HOME = pathlib.Path.home()
 DIR = pathlib.Path(__file__).resolve().parent
@@ -32,18 +40,18 @@ GV_U = 0               # account index in voice.google.com/u/<n>
 TAB_URL = ""
 CHROME_APP = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 CHROME_PROFILE = "Default"
-CLAUDE = str(HOME / ".local" / "bin" / "claude")
-CLAUDE_CWD = str(HOME)
-MODEL = "opus"
-EFFORT = "high"
-PERMISSION_MODE = "auto"
-AGY = None             # optional fallback CLI, used only when Claude is out of usage
+AGENT = None           # {"kind": "claude"|"codex"|"custom", "argv": [...], "name": ...}
+FALLBACK = None        # optional second agent, used only when the first is out of usage
+AGENT_CWD = str(HOME)
+MODEL = "opus"         # Claude only; for Codex put -m <model> in agent_cmd
+EFFORT = "high"        # Claude only
+PERMISSION_MODE = "auto"  # Claude only
 POLL = 4
 SETTLE = 5             # wait for rapid-fire texts, then batch
 JOB_TIMEOUT = 3600
 SYSTEM = ""
 
-BASE_SYSTEM = """You are Claude Code running on the owner's Mac, reached by text message
+BASE_SYSTEM = """You are a coding agent running on the owner's Mac, reached by text message
 through a Google Voice number. Your final answer is sent back to them as a text.
 - Do the task fully and autonomously using your normal tools, skills and memory.
 - Your final answer: plain text, no markdown, no headers, short (aim under 600
@@ -57,9 +65,8 @@ through a Google Voice number. Your final answer is sent back to them as a text.
 - If their texts ask for several things, do every one of them. Reply with a bulleted
   report, one line per item: done (with the result), or blocked (and why).
 - For several independent items (a checklist, a list of people, multiple lookups),
-  use the Agent tool to run sub-agents in parallel, one per item or group, instead
-  of working through them one at a time. Then merge their results into the report.
-  Items that take one quick command each can just be parallel tool calls.
+  run them in parallel (sub-agents or parallel tool calls) if your tools allow it,
+  then merge the results into the report.
 - Long answers are fine when there are many items: they go out as several texts.
 - Line breaks reach the phone. Format for a phone screen: one item per line,
   short lines, a blank line between sections. Never a wall of text.
@@ -76,10 +83,52 @@ def _digits(v):
 def _path(v):
     return str(pathlib.Path(os.path.expanduser(str(v))))
 
+# GUI apps (Claude desktop, ChatGPT desktop, cmux) and launchd often start processes with a
+# short PATH, so CLIs installed by Homebrew, npm or the Claude installer are also looked for here.
+EXTRA_PATH = ["~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin", "~/.claude/local",
+              "~/.npm-global/bin", "~/.bun/bin", "~/.volta/bin", "~/bin"]
+
+def search_path():
+    parts = os.environ.get("PATH", "").split(os.pathsep) + [_path(x) for x in EXTRA_PATH]
+    seen, out = set(), []
+    for x in parts:
+        if x and x not in seen: seen.add(x); out.append(x)
+    return os.pathsep.join(out)
+
+def which(exe):
+    if "/" in exe:
+        exe = _path(exe)
+        return exe if os.path.isfile(exe) and os.access(exe, os.X_OK) else None
+    return shutil.which(exe, path=search_path())
+
+def resolve_agent(spec, claude_path=None):
+    """Turn "claude", "claude -p --model sonnet", "codex exec -m gpt-5" or any other command
+    into {"kind", "argv", "name"}. Raises ConfigError if the binary cannot be found."""
+    if not spec: spec = "claude"
+    argv = list(spec) if isinstance(spec, list) else shlex.split(str(spec))
+    if not argv: argv = ["claude"]
+    name = os.path.basename(argv[0])
+    kind = "claude" if name == "claude" else "codex" if name == "codex" else "custom"
+    if kind == "claude" and claude_path and argv[0] == "claude":
+        argv[0] = claude_path                          # old "claude_path" key still works
+    exe = which(argv[0])
+    if not exe:
+        raise ConfigError("Could not find %r on PATH or in %s. Install it, or set \"agent_cmd\" in "
+                          "config.json (or the AGENT_CMD env var) to its full path, e.g. "
+                          "\"/opt/homebrew/bin/codex exec\" (`which codex` prints it)."
+                          % (argv[0], ", ".join(EXTRA_PATH)))
+    argv[0] = exe
+    if kind == "claude":
+        argv = [argv[0]] + [a for a in argv[1:] if a not in ("-p", "--print")]
+    if kind == "codex" and "exec" not in argv[1:2]:
+        argv.insert(1, "exec")
+    return {"kind": kind, "argv": argv, "name": "Codex" if kind == "codex" else
+            "Claude" if kind == "claude" else name}
+
 def configure(cfg):
     """Validate a config dict and set the module globals from it."""
     global ALLOWED, CLAUDE_GV, GV_ACCOUNT, REPLY_FROM, GMAIL_U, GV_U, TAB_URL, CHROME_APP, \
-        CHROME_PROFILE, CLAUDE, CLAUDE_CWD, MODEL, EFFORT, PERMISSION_MODE, AGY, POLL, SETTLE, \
+        CHROME_PROFILE, AGENT, FALLBACK, AGENT_CWD, MODEL, EFFORT, PERMISSION_MODE, POLL, SETTLE, \
         JOB_TIMEOUT, SYSTEM
     errs = []
     allowed = [_digits(x)[-10:] for x in cfg.get("allowed_senders") or []]
@@ -92,6 +141,13 @@ def configure(cfg):
     acct = str(cfg.get("google_account_email") or "").strip()
     if "@" not in acct:
         errs.append('"google_account_email" must be the Google account signed in to Gmail and Google Voice')
+    agent = fallback = None
+    try:
+        agent = resolve_agent(os.environ.get("AGENT_CMD") or cfg.get("agent_cmd"), cfg.get("claude_path"))
+        if cfg.get("fallback_agent_cmd"):
+            fallback = resolve_agent(cfg["fallback_agent_cmd"])
+    except ConfigError as ex:
+        errs.append(str(ex))
     if errs:
         raise ConfigError("Bad config:\n  " + "\n  ".join(errs))
     ALLOWED = allowed
@@ -103,12 +159,11 @@ def configure(cfg):
     TAB_URL = "https://mail.google.com/mail/u/%d/?%s#inbox" % (GMAIL_U, MARK)
     CHROME_APP = cfg.get("chrome_app") or CHROME_APP
     CHROME_PROFILE = cfg.get("chrome_profile") or "Default"
-    CLAUDE = _path(cfg.get("claude_path") or "~/.local/bin/claude")
-    CLAUDE_CWD = _path(cfg.get("claude_cwd") or "~")
+    AGENT, FALLBACK = agent, fallback
+    AGENT_CWD = _path(cfg.get("agent_cwd") or cfg.get("claude_cwd") or "~")
     MODEL = cfg.get("model") or "opus"
     EFFORT = cfg.get("effort") or "high"
     PERMISSION_MODE = cfg.get("permission_mode") or "auto"
-    AGY = _path(cfg["fallback_agy_path"]) if cfg.get("fallback_agy_path") else None
     POLL = float(cfg.get("poll_seconds", 4))
     SETTLE = float(cfg.get("settle_seconds", 5))
     JOB_TIMEOUT = int(cfg.get("job_timeout_seconds", 3600))
@@ -124,8 +179,6 @@ def load_config(path=None):
     except ValueError as ex:
         raise ConfigError("%s is not valid JSON: %s" % (path, ex))
     configure(cfg)
-    if not pathlib.Path(CLAUDE).exists():
-        raise ConfigError('"claude_path" %s does not exist. Run `which claude` and put that path in config.json.' % CLAUDE)
     return cfg
 
 def log(*a):
@@ -357,9 +410,19 @@ LIMIT_RE = re.compile(r"usage limit|limit reached|out of (extra )?usage|rate.?li
 
 CUR = {"proc": None, "prompt": "", "start": 0, "stopped": False}
 
+def child_env():
+    """Environment for the agent CLI: a PATH that finds node/homebrew tools even when the
+    watcher was started from a GUI app, minus the markers an outer Claude Code session sets
+    (so a watcher launched from inside Claude Code can still run `claude -p`)."""
+    env = dict(os.environ)
+    env["PATH"] = search_path()
+    for k in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"):
+        env.pop(k, None)
+    return env
+
 def run(cmd):
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                         cwd=CLAUDE_CWD, start_new_session=True)
+                         cwd=AGENT_CWD, env=child_env(), start_new_session=True)
     CUR["proc"] = p
     try: out, err = p.communicate(timeout=JOB_TIMEOUT)
     except subprocess.TimeoutExpired:
@@ -367,46 +430,94 @@ def run(cmd):
     CUR["proc"] = None
     return p.returncode, out or "", err or ""
 
-def run_agy(state, prompt):
-    """Optional fallback when Claude is out of usage (set "fallback_agy_path" in config).
-    Runs in the fallback CLI's default asking mode, so anything needing approval is
-    declined rather than auto-run."""
-    cmd = [AGY, "-p", prompt, "--output-format", "json", "--effort", EFFORT]
-    if state.get("agy_conv"): cmd += ["--conversation", state["agy_conv"]]
-    rc, out, err = run(cmd)
-    j = None
-    for line in reversed(out.strip().splitlines()):
-        try: j = json.loads(line); break
-        except Exception: continue
-    if j and j.get("conversation_id"): state["agy_conv"] = j["conversation_id"]
-    if j and j.get("status") != "ERROR" and j.get("response"):
-        return "(via fallback) " + j["response"].strip()
-    e = (j or {}).get("error") or (err or out)[-200:]
-    return None if not e else "Fallback failed too: " + e.strip()[:200]
+def _has(argv, *flags):
+    return any(a == f or a.startswith(f + "=") for a in argv for f in flags)
 
-def run_claude(state, prompt):
-    cmd = [CLAUDE, "-p", prompt, "--output-format", "json", "--permission-mode", PERMISSION_MODE,
-           "--model", MODEL, "--effort", EFFORT, "--append-system-prompt", SYSTEM]
-    if state.get("session"): cmd += ["--resume", state["session"]]
+def run_claude(agent, sessions, key, prompt):
+    """`claude -p ... --output-format json`, resuming the same session every time."""
+    argv = agent["argv"]
+    cmd = argv + ["-p", prompt, "--output-format", "json"]
+    if not _has(argv, "--permission-mode", "--dangerously-skip-permissions"):
+        cmd += ["--permission-mode", PERMISSION_MODE]
+    if not _has(argv, "--model"): cmd += ["--model", MODEL]
+    if not _has(argv, "--effort"): cmd += ["--effort", EFFORT]
+    cmd += ["--append-system-prompt", SYSTEM]
+    if sessions.get(key): cmd += ["--resume", sessions[key]]
     rc, out, err = run(cmd)
-    if CUR["stopped"]: return None
     j = None
     try: j = json.loads(out)
     except Exception: pass
-    if j and j.get("session_id"): state["session"] = j["session_id"]
+    if j and j.get("session_id"): sessions[key] = j["session_id"]
     text = ((j or {}).get("result") or "").strip()
-    failed = (j is None) or j.get("is_error") or rc != 0
-    blob = text + " " + err + " " + (out if j is None else "")
+    failed = bool((j is None) or j.get("is_error") or rc != 0)
+    if failed and sessions.get(key) and "resume" in err.lower():
+        sessions[key] = None
+    return text, failed, (text + " " + err + " " + (out if j is None else "")).strip()
+
+def run_codex(agent, sessions, key, prompt):
+    """`codex exec --json -o <file>`; the first run starts a thread, later runs use
+    `codex exec resume <thread_id>`. Codex has no system-prompt flag, so the house rules
+    go at the top of the first message of each thread."""
+    argv = agent["argv"]
+    fd, last = tempfile.mkstemp(prefix="instinct-", suffix=".txt"); os.close(fd)
+    cmd = list(argv)
+    if not _has(argv, "--skip-git-repo-check"): cmd += ["--skip-git-repo-check"]
+    if not _has(argv, "--sandbox", "-s", "--dangerously-bypass-approvals-and-sandbox"):
+        cmd += ["--sandbox", "workspace-write"]
+    cmd += ["--json", "-o", last]
+    sid = sessions.get(key)
+    cmd += ["resume", sid, prompt] if sid else [SYSTEM + "\n---\n" + prompt]
+    try:
+        rc, out, err = run(cmd)
+        text = pathlib.Path(last).read_text().strip() if os.path.exists(last) else ""
+    finally:
+        try: os.unlink(last)
+        except OSError: pass
+    errors = []
+    for line in out.splitlines():
+        try: e = json.loads(line)
+        except Exception: continue
+        if not isinstance(e, dict): continue
+        if e.get("type") == "thread.started" and e.get("thread_id"): sessions[key] = e["thread_id"]
+        elif e.get("type") == "error": errors.append(str(e.get("message", "")))
+        elif e.get("type") == "turn.failed": errors.append(str((e.get("error") or {}).get("message", "")))
+    failed = rc != 0 or (not text and bool(errors))
+    blob = (" ".join(errors) + " " + err).strip()
+    if failed and sid and re.search(r"resume|not found|no (such )?(session|thread)", blob, re.I):
+        sessions[key] = None
+    return text, failed, blob or out[-300:]
+
+def run_custom(agent, sessions, key, prompt):
+    """Any other CLI: the prompt (with the house rules on top) replaces a {prompt} argument,
+    or is added as the last argument. Its stdout is the answer. No session memory."""
+    full = SYSTEM + "\n---\n" + prompt
+    argv = agent["argv"]
+    cmd = [a.replace("{prompt}", full) for a in argv] if any("{prompt}" in a for a in argv) else argv + [full]
+    rc, out, err = run(cmd)
+    text = out.strip()
+    return text, rc != 0, (err + " " + text).strip()
+
+RUNNERS = {"claude": run_claude, "codex": run_codex, "custom": run_custom}
+
+def run_agent(agent, role, state, prompt):
+    sessions = state.setdefault("sessions", {})
+    return RUNNERS[agent["kind"]](agent, sessions, role + ":" + agent["kind"], prompt)
+
+def run_job(state, prompt):
+    """Run the prompt through the agent. Returns the reply text, or None if stopped."""
+    text, failed, blob = run_agent(AGENT, "primary", state, prompt)
+    if CUR["stopped"]: return None
+    name = AGENT["name"]
     if failed and LIMIT_RE.search(blob):
-        if AGY:
-            log("Claude out of usage -> falling back to", AGY)
-            alt = run_agy(state, prompt)
-            return alt or "Claude is out of usage and the fallback gave no answer."
-        return "Claude is out of usage right now. Try again later."
+        if FALLBACK:
+            log("%s out of usage -> falling back to %s" % (name, FALLBACK["name"]))
+            alt, alt_failed, alt_blob = run_agent(FALLBACK, "fallback", state, prompt)
+            if CUR["stopped"]: return None
+            if alt and not alt_failed: return "(via %s) %s" % (FALLBACK["name"], alt)
+            return "%s is out of usage and %s failed too: %s" % (name, FALLBACK["name"], alt_blob[-200:])
+        return "%s is out of usage right now. Try again later." % name
     if failed:
-        if state.get("session") and "resume" in err.lower():
-            state["session"] = None
-        return "Hit an error running that: " + (text or err or out)[-300:]
+        return "Hit an error running that: " + (text or blob)[-300:]
     return text or "Done (no text output)."
 
 JOBS = queue.Queue()
@@ -420,7 +531,7 @@ def worker(state):
         prompt = "[Text(s) from the owner, %s]\n" % datetime.datetime.now().strftime("%a %b %-d %-I:%M %p") + "\n\n".join(batch)
         CUR.update(prompt=prompt, start=time.time(), stopped=False); LAST_HEX[0] = hexid
         try:
-            answer = run_claude(state, prompt); save(state)
+            answer = run_job(state, prompt); save(state)
             if answer is None:
                 log("job stopped"); continue
             log("REPLY:", repr(answer[:300]))
@@ -536,17 +647,132 @@ def drain_outbox():
         f.rename(f.with_suffix(".sent"))
         log("outbox sent:", f.name)
 
+def init_config(a):
+    """Write config.json from the command line, keeping any values already in it.
+    Non-interactive on purpose, so an agent (or you) can run it in one line."""
+    path = pathlib.Path(CONFIG_PATH)
+    cfg = json.loads((DIR / "config.example.json").read_text())
+    cfg["agent_cmd"] = "claude"
+    if path.exists(): cfg.update(json.loads(path.read_text()))
+    if a.phone: cfg["allowed_senders"] = a.phone
+    if a.gv_number: cfg["gv_number"] = a.gv_number
+    if a.email:
+        if cfg.get("reply_from_email") in (None, "", cfg.get("google_account_email"), "you@example.com"):
+            cfg["reply_from_email"] = a.email
+        cfg["google_account_email"] = a.email
+    if a.agent_cmd:
+        cfg["agent_cmd"] = a.agent_cmd
+        cfg.pop("claude_path", None)
+    try:
+        configure(cfg)
+    except ConfigError as ex:
+        print(ex, file=sys.stderr); sys.exit(2)
+    path.write_text(json.dumps(cfg, indent=2) + "\n")
+    print("Wrote %s (agent: %s at %s)" % (path, AGENT["name"], AGENT["argv"][0]))
+    print("Next: python3 watcher.py --check")
+
+def chrome_pref_apple_events():
+    """True/False from Chrome's Preferences file, or None if it cannot be read. Chrome writes
+    this file lazily, so a fresh change may not show up until Chrome saves it."""
+    f = HOME / "Library/Application Support/Google/Chrome" / CHROME_PROFILE / "Preferences"
+    try: prefs = json.loads(f.read_text())
+    except Exception: return None
+    for root in (prefs.get("account_values") or {}, prefs):
+        v = (root.get("browser") or {}).get("allow_javascript_apple_events")
+        if v is not None: return bool(v)
+    return False
+
+def check():
+    """Offline preflight. Never touches Chrome tabs, so it triggers no permission prompts."""
+    bad = 0
+    def say(ok, msg):
+        print(("ok    " if ok is True else "WARN  " if ok is None else "FAIL  ") + msg)
+    try:
+        load_config()
+        say(True, "config %s (replies go to ...%s, GV number ...%s)" % (CONFIG_PATH, ALLOWED[0][-4:], CLAUDE_GV[-4:]))
+    except ConfigError as ex:
+        say(False, str(ex)); return 2
+    for role, ag in (("agent", AGENT), ("fallback", FALLBACK)):
+        if not ag: continue
+        try:
+            r = subprocess.run([ag["argv"][0], "--version"], capture_output=True, text=True,
+                               timeout=30, env=child_env())
+            v = (r.stdout or r.stderr).strip().splitlines()
+            say(r.returncode == 0, "%s: %s -> %s" % (role, " ".join(ag["argv"]), v[0] if v else "rc=%d" % r.returncode))
+            bad += r.returncode != 0
+        except Exception as ex:
+            say(False, "%s: %s failed to run: %s" % (role, ag["argv"][0], ex)); bad += 1
+    print("      (make sure it is logged in: run it once by hand, e.g. `claude` or `codex login`)")
+    if not os.path.exists(CHROME_APP):
+        say(False, "Chrome not found at %s (set chrome_app in config.json)" % CHROME_APP); bad += 1
+    try:
+        say(True, "real Chrome running (pid %d)" % chrome_pid())
+    except RuntimeError:
+        say(None, "Chrome is not running. Open it and sign in to %s." % GV_ACCOUNT)
+    ps = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True).stdout
+    stray = [l.strip().split(" ")[0] for l in ps.splitlines()
+             if CHROME_APP in l and "--type=" not in l and ("--headless" in l or "--user-data-dir" in l)]
+    if stray:
+        say(None, "extra Chrome instance(s) running (headless or test profile), pids %s. They can grab "
+                  "AppleScript from your real Chrome; quit them if the watcher misbehaves." % ", ".join(stray))
+    pref = chrome_pref_apple_events()
+    if pref:
+        say(True, "Chrome: Allow JavaScript from Apple Events is on")
+    else:
+        say(None, "Chrome: turn on View > Developer > Allow JavaScript from Apple Events"
+                  + ("" if pref is False else " (could not read Chrome's settings to confirm)"))
+    print("""
+Manual steps only you can do (the watcher cannot click these):
+  1. voice.google.com > Settings > Messages: turn on "Forward messages to email".
+  2. Text your Google Voice number once from your phone so a thread exists in Gmail.
+  3. Chrome: View > Developer > Allow JavaScript from Apple Events.
+  4. On first run macOS asks "<app> wants to control Google Chrome". Click Allow. <app> is
+     whatever started the watcher (Terminal with --start). To fix a Deny later: System
+     Settings > Privacy & Security > Automation > <app> > Google Chrome.
+Then start it: python3 watcher.py --start""")
+    return 1 if bad else 0
+
+def start(app):
+    """Open run.sh in its own terminal window, outside the agent's process and sandbox, so
+    it keeps running after the agent session ends."""
+    run_sh = DIR / "run.sh"
+    os.chmod(run_sh, 0o755)
+    r = subprocess.run(["open", "-a", app, str(run_sh)], capture_output=True, text=True)
+    if r.returncode != 0:
+        print("Could not open %s (%s). Open a terminal yourself and run:\n  cd %s && ./run.sh"
+              % (app, r.stderr.strip(), shlex.quote(str(DIR))), file=sys.stderr)
+        return 1
+    print("Started run.sh in a new %s window. Leave it open. Allow the 'control Google Chrome' "
+          "prompt if macOS shows one, then text your Google Voice number \"status\"." % app)
+    return 0
+
+def prime(state):
+    state["seen"] = []; scan(state); log("primed", len(state["seen"]))
+
 def main():
+    ap = argparse.ArgumentParser(description="Text your coding agent from your phone through Google Voice.")
+    ap.add_argument("--init", action="store_true", help="write config.json from the flags below")
+    ap.add_argument("--phone", action="append", help="your cell number (repeat for more allowed senders)")
+    ap.add_argument("--gv-number", help="your Google Voice number")
+    ap.add_argument("--email", help="Google account that owns the Google Voice number")
+    ap.add_argument("--agent-cmd", help='agent CLI, e.g. "claude" (default) or "codex exec"')
+    ap.add_argument("--check", action="store_true", help="offline preflight checks")
+    ap.add_argument("--start", action="store_true", help="launch run.sh in its own terminal window")
+    ap.add_argument("--app", default="Terminal", help="terminal app for --start (Terminal, iTerm, ...)")
+    ap.add_argument("--prime", action="store_true", help="mark existing texts as seen and exit")
+    a = ap.parse_args()
+    if a.init: return init_config(a)
+    if a.check: sys.exit(check())
+    if a.start: sys.exit(start(a.app))
     try:
         load_config()
     except ConfigError as ex:
         print(ex, file=sys.stderr); sys.exit(2)
     state = load()
-    if "--prime" in sys.argv:   # mark every message in known threads as seen
-        state["seen"] = []; scan(state); log("primed", len(state["seen"])); return
-    if "seen" not in state:
-        log("no seen-list yet: run with --prime first"); return
-    log("watcher started")
+    if a.prime: return prime(state)
+    if "seen" not in state:     # first run: don't treat old texts as new requests
+        prime(state)
+    log("watcher started (agent: %s)" % " ".join(AGENT["argv"]))
     threading.Thread(target=worker, args=(state,), daemon=True).start()
     threading.Thread(target=heartbeat, daemon=True).start()
     flag = DIR / "restart.flag"           # touch this to restart safely (run.sh relaunches)

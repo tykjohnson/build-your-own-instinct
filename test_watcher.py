@@ -1,13 +1,45 @@
-"""Offline regression tests: python3 test_watcher.py (no Chrome, no config.json, no texts sent)."""
-import sys, time
+"""Offline regression tests: python3 test_watcher.py
+(no Chrome, no config.json, no texts sent, no real agent CLI needed: fake ones are used)."""
+import sys, time, os, json, tempfile, pathlib
 sys.argv = ['x']
 import watcher as w
+
+FAKE = pathlib.Path(tempfile.mkdtemp(prefix="instinct-test-"))
+
+def fake_cli(name, body):
+    f = FAKE / name
+    f.write_text("#!/usr/bin/env python3\nimport sys, json, os\nargs = sys.argv[1:]\n" + body)
+    f.chmod(0o755)
+    return str(f)
+
+# Fake claude: echoes the prompt back as a JSON result, reports a session id.
+FAKE_CLAUDE = fake_cli("claude", """
+p = args[args.index('-p') + 1]
+sid = args[args.index('--resume') + 1] if '--resume' in args else 'sess-1'
+if 'LIMIT' in p:
+    print(json.dumps({'is_error': True, 'result': 'Claude usage limit reached'})); sys.exit(1)
+print(json.dumps({'result': 'claude:' + p.splitlines()[-1], 'session_id': sid}))
+""")
+# Fake codex: JSONL events on stdout, final message written to the -o file.
+FAKE_CODEX = fake_cli("codex", """
+assert args[0] == 'exec', args
+assert '--skip-git-repo-check' in args and '--json' in args
+out = args[args.index('-o') + 1]
+if 'resume' in args:
+    tid = args[args.index('resume') + 1]
+else:
+    tid = 'thread-1'
+    print(json.dumps({'type': 'thread.started', 'thread_id': tid}))
+open(out, 'w').write('codex:' + tid + ':' + args[-1].splitlines()[-1])
+print(json.dumps({'type': 'turn.completed'}))
+""")
 
 # Fake values only (555 numbers are reserved for fiction).
 w.configure({
     "allowed_senders": ["+1 (555) 555-0123"],
     "gv_number": "+1 555 555 0100",
     "google_account_email": "you@example.com",
+    "agent_cmd": FAKE_CLAUDE,
 })
 
 sent = []
@@ -82,5 +114,63 @@ def test_unknown_sender_ignored():
     st = {"threads": {addr: "def"}, "seen": []}
     assert w.scan(st) == []
 
+def test_resolve_agent_kinds():
+    a = w.resolve_agent(FAKE_CLAUDE + " -p --model sonnet")
+    assert a["kind"] == "claude" and "-p" not in a["argv"] and a["argv"][-2:] == ["--model", "sonnet"], a
+    c = w.resolve_agent(FAKE_CODEX + " -m some-model")
+    assert c["kind"] == "codex" and c["argv"][1] == "exec", c
+    assert w.resolve_agent([FAKE_CODEX, "exec"])["argv"].count("exec") == 1
+    assert w.resolve_agent("/bin/echo {prompt}")["kind"] == "custom"
+    try: w.resolve_agent("/nonexistent/agent-cli")
+    except w.ConfigError as ex: assert "agent_cmd" in str(ex)
+    else: raise AssertionError("missing CLI accepted")
+
+def test_agent_cmd_env_overrides_config():
+    os.environ["AGENT_CMD"] = FAKE_CODEX + " exec"
+    try:
+        w.configure({"allowed_senders": ["5555550123"], "gv_number": "5555550100",
+                     "google_account_email": "you@example.com", "agent_cmd": FAKE_CLAUDE})
+        assert w.AGENT["kind"] == "codex", w.AGENT
+    finally:
+        del os.environ["AGENT_CMD"]
+        w.configure({"allowed_senders": ["5555550123"], "gv_number": "5555550100",
+                     "google_account_email": "you@example.com", "agent_cmd": FAKE_CLAUDE})
+
+def test_claude_runner_resumes_session():
+    st = {}
+    assert w.run_job(st, "hi") == "claude:hi"
+    assert st["sessions"]["primary:claude"] == "sess-1"
+    assert w.run_job(st, "again") == "claude:again"
+
+def test_codex_runner_resumes_thread():
+    old = w.AGENT
+    w.AGENT = w.resolve_agent(FAKE_CODEX)
+    try:
+        st = {}
+        assert w.run_job(st, "first") == "codex:thread-1:first", st
+        assert st["sessions"]["primary:codex"] == "thread-1"
+        assert w.run_job(st, "second") == "codex:thread-1:second"
+    finally:
+        w.AGENT = old
+
+def test_custom_runner_and_fallback_on_usage_limit():
+    old = w.FALLBACK
+    w.FALLBACK = w.resolve_agent("/bin/echo {prompt}")
+    try:
+        r = w.run_job({}, "LIMIT please")
+        assert r.startswith("(via echo) ") and r.endswith("LIMIT please"), r
+        w.FALLBACK = None
+        assert "out of usage" in w.run_job({}, "LIMIT again")
+    finally:
+        w.FALLBACK = old
+
+def test_child_env_drops_outer_claude_session():
+    os.environ["CLAUDECODE"] = "1"
+    try: assert "CLAUDECODE" not in w.child_env()
+    finally: del os.environ["CLAUDECODE"]
+    assert "/opt/homebrew/bin" in w.child_env()["PATH"]
+
 for name, fn in list(globals().items()):
     if name.startswith("test_"): fn(); print("ok", name)
+
+import shutil; shutil.rmtree(FAKE, ignore_errors=True)
