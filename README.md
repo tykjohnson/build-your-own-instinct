@@ -165,9 +165,19 @@ minutes):
 
 - If nobody has touched the Mac's keyboard or mouse for `idle_needed_seconds` (default 10
   minutes) and it hasn't restarted Chrome in the last 30 minutes, it quits Chrome (a normal
-  quit, so Chrome restores its tabs; force-quit only if Chrome ignores that for 45 seconds),
-  reopens it, waits until it answers, runs your `after_chrome_restart` script if you set
-  one, and texts you that it restarted Chrome.
+  quit, so Chrome saves its session; force-quit only if Chrome ignores that for 45 seconds),
+  starts it again with `chrome_profile`, reopens your windows, waits until Chrome answers,
+  runs your `after_chrome_restart` script if you set one, and texts you that it restarted
+  Chrome.
+- Reopening windows: if Chrome's "On startup" setting is "Open the New Tab page", a restart
+  would come back with none of your windows. So for each profile in Chrome's `Local State`,
+  the watcher reads the newest `Sessions/Session_*` file saved before the quit (`snss.py`
+  parses Chrome's session format) and opens each normal window again with its tabs in order,
+  up to 40 per window. It leaves out its own Gmail and Voice tabs (it reopens those itself),
+  repeated URLs and New Tab pages. Closed tabs, popups and app windows stay closed. Profiles
+  set to "Continue where you left off" are skipped, since Chrome restores those itself. Set
+  `"restore_windows_after_restart": false` to turn this off. Only each tab's current page
+  comes back, not its back/forward history.
 - If someone is using the Mac (or `auto_restart_chrome` is `false`), it sends one alert
   instead, through iMessage to `alert_imessage` if you set it, otherwise only to the log.
   Quit and reopen Chrome yourself and the watcher picks up again on its own.
@@ -219,7 +229,8 @@ required value is wrong.
 | `google_account_email` | yes | The Google account signed in to Gmail and Google Voice. The watcher refuses to send from a Voice tab signed in as anyone else. |
 | `reply_from_email` | no | From address for the Gmail fallback reply. Defaults to `google_account_email`. |
 | `gmail_account_index`, `gv_account_index` | no | The `N` in `mail.google.com/mail/u/N` and `voice.google.com/u/N` if you are signed in to several Google accounts. Default 0. |
-| `chrome_app`, `chrome_profile` | no | Chrome binary and the profile folder name used when the watcher has to open its tab. |
+| `chrome_app`, `chrome_profile` | no | Chrome binary and the profile folder name used when the watcher has to open its tab or restart Chrome. |
+| `chrome_user_data_dir` | no | Chrome's data folder, where `Local State`, profile `Preferences` and session files live. Default `~/Library/Application Support/Google/Chrome`. |
 | `agent_cmd` | no | The agent CLI. See Choosing the agent. Default `claude`. |
 | `agent_cwd` | no | Working directory for the agent. Default is your home folder. |
 | `model`, `effort` | no | Claude only: passed to `claude --model` and `--effort`. |
@@ -231,6 +242,7 @@ required value is wrong.
 | `auto_restart_chrome` | no | Restart Chrome when it has been frozen a while and nobody is using the Mac. Default `true`. See When Chrome freezes. |
 | `restart_after_seconds`, `idle_needed_seconds` | no | How long Chrome must be frozen, and how long the Mac must be untouched, before an auto-restart. Default 600 each. |
 | `after_chrome_restart` | no | A script to run after an auto-restart, e.g. to restart other jobs that drive Chrome. Run directly if executable, else with `bash`. Output goes to `after-restart.log`. Default none. |
+| `restore_windows_after_restart` | no | After an auto-restart, reopen the windows and tabs each profile had open. Default `true`. |
 | `alert_imessage` | no | Phone number or Apple ID to iMessage (through Messages.app) when Chrome is frozen and the watcher won't restart it. Google Voice can't send while Chrome is frozen. Default none: the alert only goes to the log. The first alert makes macOS ask to let the watcher's app control Messages. |
 
 ## Gotchas
@@ -282,9 +294,10 @@ required value is wrong.
 - Parallel jobs share one Mac. Two tasks that edit the same files can collide; the prompt
   tells each agent what the others are doing, but nothing locks files.
 - Parallel jobs use your agent's usage limits faster.
-- Auto-restart quits your whole Chrome, not just the watcher's tabs. Chrome restores its
-  tabs, but unsaved form input and the open popup are lost. It only happens when the Mac has
-  been idle; set `"auto_restart_chrome": false` to turn it off.
+- Auto-restart quits your whole Chrome, not just the watcher's tabs. The watcher reopens
+  your windows from Chrome's session files, but unsaved form input, tab history and the open
+  popup are lost. It only happens when the Mac has been idle; set
+  `"auto_restart_chrome": false` to turn it off.
 
 Run the offline tests (no Chrome, no config, no texts sent, fake agent CLIs) with
 `python3 test_watcher.py`.

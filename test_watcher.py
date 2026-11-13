@@ -432,16 +432,18 @@ def test_restart_chrome_sequence():
             kills.append((pid, sig))
             if sig == 0 and not ignores_term and len(kills) > 2: raise OSError("gone")
         reset_stuck(since=time.time() - 700)
+        restored = []
         with Stubs(chrome_pid=lambda: 4242, jxa=lambda body: "1", _sleep=lambda s: None,
                    send_reply=lambda hx, t, digits=None: notes.append(t), AFTER_RESTART=str(hook),
-                   AFTER_LOG=FAKE / "after.log",
+                   AFTER_LOG=FAKE / "after.log", restore_windows=restored.append,
                    **{"os.kill": kill, "subprocess.Popen": lambda argv, **k: popens.append(argv)}):
             assert w.restart_chrome() is True
         sigs = [s for _, s in kills]
         assert all(p == 4242 for p, _ in kills) and sigs[0] == w.signal.SIGTERM, kills
         assert (w.signal.SIGKILL in sigs) == ignores_term, sigs
         if ignores_term: assert sigs.count(0) == 45
-        assert popens == [["open", "-a", "/Applications/Google Chrome.app"], ["/bin/bash", str(hook)]], popens
+        assert popens == [[w.CHROME_APP, "--profile-directory=Default"], ["/bin/bash", str(hook)]], popens
+        assert len(restored) == 1 and abs(restored[0] - time.time()) < 5, restored   # quit time
         assert w.STUCK["since"] == 0 and w.STUCK["restarted"] > 0
         assert len(notes) == 1 and notes[0].startswith("Heads up: Chrome stopped answering"), notes
     # Chrome never answers after relaunch: no hook, no notice, still frozen
@@ -451,12 +453,102 @@ def test_restart_chrome_sequence():
         if sig == 0: raise OSError("gone")
     def dead(body): raise RuntimeError("no answer")
     with Stubs(chrome_pid=lambda: 4242, jxa=dead, _sleep=lambda s: None, AFTER_RESTART=str(hook),
-               send_reply=lambda hx, t, digits=None: notes.append(t),
+               send_reply=lambda hx, t, digits=None: notes.append(t), RESTORE_WINDOWS=False,
+               restore_windows=lambda t: notes.append("restored"),
                **{"os.kill": gone, "subprocess.Popen": lambda argv, **k: popens.append(argv)}):
         assert w.restart_chrome() is False
-    assert popens == [["open", "-a", "/Applications/Google Chrome.app"]] and notes == []
+    assert popens == [[w.CHROME_APP, "--profile-directory=Default"]] and notes == []   # restore off
     assert w.STUCK["since"] != 0
     reset_stuck()
+
+# A tiny Chrome session file, built by hand. Command ids and layouts follow Chromium's
+# session_service_commands.cc (see snss.py).
+import struct, snss
+
+def snss_file(path, cmds):
+    out = b"SNSS" + struct.pack("<i", 3)
+    for cid, payload in cmds:
+        out += struct.pack("<H", len(payload) + 1) + bytes([cid]) + payload
+    pathlib.Path(path).write_bytes(out)
+    return path
+
+def c_tab_window(win, tab): return (0, struct.pack("<ii", win, tab))
+def c_tab_index(tab, i): return (2, struct.pack("<ii", tab, i))
+def c_nav(tab, i, url):
+    u = url.encode(); body = struct.pack("<iii", tab, i, len(u)) + u + b"\0" * (-len(u) % 4) + b"title-etc"
+    return (6, struct.pack("<I", len(body)) + body)
+def c_sel_nav(tab, i): return (7, struct.pack("<ii", tab, i))
+def c_win_type(win, ty): return (9, struct.pack("<ii", win, ty))
+def c_pinned(tab): return (12, struct.pack("<i?xxx", tab, True))
+def c_tab_closed(tab): return (16, struct.pack("<i", tab) + b"\0" * 12)       # id, padding, close time
+def c_win_closed(win): return (17, struct.pack("<i", win) + b"\0" * 12)
+
+def window_file(path, *windows):
+    """windows: lists of URLs, one normal window each."""
+    cmds, tab = [], 100
+    for wid, urls in enumerate(windows, 1):
+        for i, u in enumerate(urls):
+            tab += 1; cmds += [c_tab_window(wid, tab), c_tab_index(tab, i), c_nav(tab, 0, u)]
+    return snss_file(path, cmds)
+
+def test_snss_parse():
+    f = snss_file(FAKE / "Session_1", [
+        c_tab_window(1, 10), c_tab_window(1, 11), c_tab_window(1, 12),
+        c_tab_index(10, 1), c_tab_index(11, 0), c_tab_index(12, 2),
+        c_nav(10, 0, "https://a.example/back"), c_nav(10, 1, "https://a.example/fwd"), c_sel_nav(10, 0),
+        c_nav(11, 0, "https://b.example/"), c_nav(12, 0, "https://closed.example/"),
+        c_pinned(10),                                   # pinned: still open
+        c_tab_closed(12),                               # closed tab: left out
+        (99, b"unknown command"),
+        c_tab_window(2, 20), c_nav(20, 0, "https://popup.example/"), c_win_type(2, 1),   # popup
+        c_tab_window(3, 30), c_nav(30, 0, "https://gone.example/"), c_win_closed(3),     # closed window
+        c_tab_window(4, 40),                            # tab with no page yet: left out
+    ])
+    assert snss.parse(str(f)) == [["https://b.example/", "https://a.example/back"]], snss.parse(str(f))
+    bad = FAKE / "not-a-session"; bad.write_bytes(b"nope")
+    try: snss.parse(str(bad))
+    except ValueError: pass
+    else: raise AssertionError("non-SNSS file accepted")
+
+def test_restore_windows_picks_file_and_builds_argv():
+    root = FAKE / "chrome"
+    for prof in ("Default", "Profile 1", "Profile 2", "Profile 3"):
+        (root / prof / "Sessions").mkdir(parents=True, exist_ok=True)
+    (root / "Local State").write_text(json.dumps({"profile": {"info_cache": {
+        "Default": {}, "Profile 1": {}, "Profile 2": {}, "Profile 3": {}}}}))
+    quit_at = time.time() - 30
+    def aged(path, t): os.utime(path, (t, t)); return path
+    d = root / "Default" / "Sessions"
+    aged(window_file(d / "Session_old", ["https://old.example/"]), quit_at - 600)
+    many = ["https://m.example/%d" % i for i in range(45)]
+    aged(window_file(d / "Session_new",
+                     ["https://x.example/", "https://mail.google.com/mail/u/0/?" + w.MARK + "#inbox",
+                      "https://x.example/", "chrome://newtab/", "https://y.example/"],
+                     ["chrome://newtab/"],                          # nothing left: no window
+                     many), quit_at - 5)
+    aged(window_file(d / "Session_after", ["chrome://newtab/"]), quit_at + 20)   # the relaunched Chrome's
+    p1 = root / "Profile 1"                                         # "Continue where you left off": skipped
+    aged(window_file(p1 / "Sessions" / "Session_1", ["https://p1.example/"]), quit_at - 5)
+    (p1 / "Preferences").write_text(json.dumps({"session": {"restore_on_startup": 1}}))
+    p2 = root / "Profile 2"
+    aged(window_file(p2 / "Sessions" / "Session_2",
+                     ["https://voice.google.com/u/0/messages?gvclaudesend=5555550123", "https://p2.example/"]),
+         quit_at - 5)
+    (p2 / "Preferences").write_text(json.dumps({"session": {"restore_on_startup": 5}}))
+    popens = []
+    with Stubs(CHROME_DIR=root, _sleep=lambda s: None,
+               **{"subprocess.Popen": lambda argv, **k: popens.append(argv)}):
+        assert w.restore_windows(quit_at) == 3
+        app = w.CHROME_APP
+        assert popens == [
+            [app, "--profile-directory=Default", "--new-window", "https://x.example/", "https://y.example/"],
+            [app, "--profile-directory=Default", "--new-window"] + many[:40],
+            [app, "--profile-directory=Profile 2", "--new-window", "https://p2.example/"],
+        ], popens
+        # no Local State: falls back to chrome_profile
+        (root / "Local State").unlink(); popens.clear()
+        assert w.chrome_profiles() == ["Default"]
+        assert w.restore_windows(quit_at) == 2 and len(popens) == 2
 
 def test_self_heal_config():
     base = {"allowed_senders": ["5555550123"], "gv_number": "5555550100",
@@ -464,9 +556,12 @@ def test_self_heal_config():
     try:
         w.configure(base)
         assert w.AUTO_RESTART is True and w.RESTART_AFTER == 600 and w.IDLE_NEEDED == 600
-        assert w.AFTER_RESTART is None and w.ALERT_IMESSAGE is None
+        assert w.AFTER_RESTART is None and w.ALERT_IMESSAGE is None and w.RESTORE_WINDOWS is True
+        assert w.CHROME_DIR == pathlib.Path.home() / "Library/Application Support/Google/Chrome"
         w.configure(dict(base, auto_restart_chrome=False, restart_after_seconds=120, idle_needed_seconds=30,
-                         after_chrome_restart="~/hook.sh", alert_imessage="+1 555 555 0123"))
+                         after_chrome_restart="~/hook.sh", alert_imessage="+1 555 555 0123",
+                         restore_windows_after_restart=False, chrome_user_data_dir="~/chrome-test"))
+        assert w.RESTORE_WINDOWS is False and w.CHROME_DIR == pathlib.Path.home() / "chrome-test"
         assert w.AUTO_RESTART is False and w.RESTART_AFTER == 120 and w.IDLE_NEEDED == 30
         assert w.AFTER_RESTART == str(pathlib.Path.home() / "hook.sh") and w.ALERT_IMESSAGE == "+1 555 555 0123"
         try: w.configure(dict(base, restart_after_seconds="soon"))

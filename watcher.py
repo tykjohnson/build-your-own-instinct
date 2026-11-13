@@ -40,6 +40,7 @@ GV_U = 0               # account index in voice.google.com/u/<n>
 TAB_URL = ""
 CHROME_APP = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 CHROME_PROFILE = "Default"
+CHROME_DIR = HOME / "Library/Application Support/Google/Chrome"   # Chrome's user data folder
 AGENT = None           # {"kind": "claude"|"codex"|"custom", "argv": [...], "name": ...}
 FALLBACK = None        # optional second agent, used only when the first is out of usage
 AGENT_CWD = str(HOME)
@@ -56,6 +57,7 @@ RESTART_AFTER = 600    # Chrome frozen this long (seconds) ...
 IDLE_NEEDED = 600      # ... and no keyboard/mouse input this long -> restart Chrome
 AFTER_RESTART = None   # optional script to run after an auto-restart
 ALERT_IMESSAGE = None  # optional iMessage handle for "Chrome is stuck" alerts
+RESTORE_WINDOWS = True # reopen the windows that were open before an auto-restart
 
 BASE_SYSTEM = """You are a coding agent running on the owner's Mac, reached by text message
 through a Google Voice number. Your final answer is sent back to them as a text.
@@ -141,7 +143,7 @@ def configure(cfg):
     global ALLOWED, CLAUDE_GV, GV_ACCOUNT, REPLY_FROM, GMAIL_U, GV_U, TAB_URL, CHROME_APP, \
         CHROME_PROFILE, AGENT, FALLBACK, AGENT_CWD, MODEL, EFFORT, PERMISSION_MODE, POLL, SETTLE, \
         JOB_TIMEOUT, SYSTEM, MAX_PARALLEL, AUTO_RESTART, RESTART_AFTER, IDLE_NEEDED, AFTER_RESTART, \
-        ALERT_IMESSAGE
+        ALERT_IMESSAGE, RESTORE_WINDOWS, CHROME_DIR
     errs = []
     allowed = [_digits(x)[-10:] for x in cfg.get("allowed_senders") or []]
     if not allowed or any(len(x) != 10 for x in allowed):
@@ -183,6 +185,7 @@ def configure(cfg):
     TAB_URL = "https://mail.google.com/mail/u/%d/?%s#inbox" % (GMAIL_U, MARK)
     CHROME_APP = cfg.get("chrome_app") or CHROME_APP
     CHROME_PROFILE = cfg.get("chrome_profile") or "Default"
+    CHROME_DIR = pathlib.Path(_path(cfg.get("chrome_user_data_dir") or "~/Library/Application Support/Google/Chrome"))
     AGENT, FALLBACK = agent, fallback
     AGENT_CWD = _path(cfg.get("agent_cwd") or cfg.get("claude_cwd") or "~")
     MODEL = cfg.get("model") or "opus"
@@ -197,6 +200,7 @@ def configure(cfg):
     IDLE_NEEDED = secs["idle_needed_seconds"]
     AFTER_RESTART = _path(cfg["after_chrome_restart"]) if cfg.get("after_chrome_restart") else None
     ALERT_IMESSAGE = str(cfg.get("alert_imessage") or "").strip() or None
+    RESTORE_WINDOWS = cfg.get("restore_windows_after_restart", True) is not False
     extra = (cfg.get("system_prompt_extra") or "").strip()
     SYSTEM = BASE_SYSTEM + (extra + "\n" if extra else "")
 
@@ -282,18 +286,57 @@ def hid_idle():
     except Exception:
         return 0
 
-def chrome_bundle():
-    """The .app folder of chrome_app, for `open -a`."""
-    i = CHROME_APP.find(".app/")
-    return CHROME_APP[:i + 4] if i >= 0 else "Google Chrome"
+MAX_RESTORE_TABS = 40
+
+def chrome_profiles():
+    """Profile folder names from Chrome's Local State (just chrome_profile if unreadable)."""
+    try: return list(json.loads((CHROME_DIR / "Local State").read_text())["profile"]["info_cache"])
+    except Exception: return [CHROME_PROFILE]
+
+def reopens_last_session(prof):
+    """True if this profile's "On startup" setting is "Continue where you left off", in which
+    case Chrome brings the windows back by itself."""
+    try: return json.loads((CHROME_DIR / prof / "Preferences").read_text())["session"]["restore_on_startup"] == 1
+    except Exception: return False
+
+def restore_windows(before):
+    """Chrome set to open the New Tab page at startup comes back from a restart with none of
+    its windows. Rebuild each profile's windows from the newest Sessions/Session_* file saved
+    before the quit, leaving out the watcher's own tabs, repeated URLs and New Tab pages.
+    Returns how many windows were reopened."""
+    import snss
+    n = 0
+    for prof in chrome_profiles():
+        if reopens_last_session(prof): continue
+        try:
+            files = [f for f in (CHROME_DIR / prof / "Sessions").glob("Session_*") if f.stat().st_mtime <= before + 2]
+        except OSError:
+            continue
+        if not files: continue
+        newest = max(files, key=lambda f: f.stat().st_mtime)
+        try: windows = snss.parse(str(newest))
+        except Exception as ex:
+            log("could not read %s: %s" % (newest.name, ex)); continue
+        for urls in windows:
+            keep = []
+            for u in urls:
+                if not u or MARK in u or "gvclaudesend=" in u or u in keep or u.startswith("chrome://newtab"): continue
+                keep.append(u)
+            if not keep: continue
+            subprocess.Popen([CHROME_APP, "--profile-directory=" + prof, "--new-window"] + keep[:MAX_RESTORE_TABS],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            log("restored a %s window with %d tabs" % (prof, min(len(keep), MAX_RESTORE_TABS)))
+            n += 1
+            _sleep(4)
+    return n
 
 def _hhmm(t):
     return time.strftime("%-I:%M %p", time.localtime(t))
 
 def restart_chrome():
-    """Quit the frozen Chrome (SIGTERM, so it restores its tabs on relaunch), force it only if
-    it ignores that, relaunch it, wait until it answers, run the optional hook, and text the
-    owner through the normal reply path."""
+    """Quit the frozen Chrome (SIGTERM, so it saves its session), force it only if it ignores
+    that, relaunch it, reopen the windows it had, wait until it answers, run the optional hook,
+    and text the owner through the normal reply path."""
     pid = chrome_pid()
     since = STUCK["since"]
     log("auto-restarting Chrome (pid %d), frozen since %s" % (pid, _hhmm(since)))
@@ -305,7 +348,14 @@ def restart_chrome():
         except OSError: break
     else:
         log("Chrome ignored SIGTERM, forcing"); os.kill(pid, signal.SIGKILL); _sleep(3)
-    subprocess.Popen(["open", "-a", chrome_bundle()])
+    t_quit = time.time()
+    # Launch the binary with a profile, not `open -a`: that can stop at the profile picker.
+    subprocess.Popen([CHROME_APP, "--profile-directory=" + CHROME_PROFILE],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    _sleep(8)
+    if RESTORE_WINDOWS:
+        try: restore_windows(t_quit)
+        except Exception as ex: log("window restore failed:", ex)
     for _ in range(24):                                   # up to 2 min to answer again
         _sleep(5)
         try: jxa("c.windows().length"); break
@@ -906,7 +956,7 @@ def init_config(a):
 def chrome_pref_apple_events():
     """True/False from Chrome's Preferences file, or None if it cannot be read. Chrome writes
     this file lazily, so a fresh change may not show up until Chrome saves it."""
-    f = HOME / "Library/Application Support/Google/Chrome" / CHROME_PROFILE / "Preferences"
+    f = CHROME_DIR / CHROME_PROFILE / "Preferences"
     try: prefs = json.loads(f.read_text())
     except Exception: return None
     for root in (prefs.get("account_values") or {}, prefs):

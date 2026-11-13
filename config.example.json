@@ -22,5 +22,7 @@
   "restart_after_seconds": 600,
   "idle_needed_seconds": 600,
   "after_chrome_restart": null,
-  "alert_imessage": null
+  "alert_imessage": null,
+  "restore_windows_after_restart": true,
+  "chrome_user_data_dir": "~/Library/Application Support/Google/Chrome"
 }
