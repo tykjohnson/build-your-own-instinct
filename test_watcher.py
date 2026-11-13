@@ -12,13 +12,19 @@ def fake_cli(name, body):
     f.chmod(0o755)
     return str(f)
 
-# Fake claude: echoes the prompt back as a JSON result, reports a session id.
+# Fake claude: echoes the text back as a JSON result, reports a session id. A forked
+# session gets a new id, like the real CLI. "SLOW" texts run until they are killed.
 FAKE_CLAUDE = fake_cli("claude", """
+import time
 p = args[args.index('-p') + 1]
+lines = p.splitlines()
+text = lines[1] if lines[0].startswith('[Text') else lines[-1]
 sid = args[args.index('--resume') + 1] if '--resume' in args else 'sess-1'
+if '--fork-session' in args: sid = 'fork-' + sid
+if 'SLOW' in p: time.sleep(60)
 if 'LIMIT' in p:
     print(json.dumps({'is_error': True, 'result': 'Claude usage limit reached'})); sys.exit(1)
-print(json.dumps({'result': 'claude:' + p.splitlines()[-1], 'session_id': sid}))
+print(json.dumps({'result': 'claude:' + text, 'session_id': sid}))
 """)
 # Fake codex: JSONL events on stdout, final message written to the -o file.
 FAKE_CODEX = fake_cli("codex", """
@@ -89,10 +95,10 @@ def test_long_reply_splits_without_loss():
     assert "line 0 " in joined and "line 39 " in joined
 
 def test_restart_flag_waits_for_idle():
-    # busy job -> must not exit; idle + empty queue -> may exit
-    w.CUR["start"] = time.time(); assert not (not w.CUR["start"] and w.JOBS.empty())
-    w.CUR["start"] = 0; w.JOBS.put(("x", "h")); assert not (not w.CUR["start"] and w.JOBS.empty())
-    w.JOBS.get(); assert (not w.CUR["start"] and w.JOBS.empty())
+    # any running job -> must not exit; no jobs -> may exit
+    assert w.idle()
+    w.RUNNING[999] = w.new_job("x", "h"); assert not w.idle()
+    w.RUNNING.pop(999); assert w.idle()
 
 GV_ADDR = "15555550100.15555550123.Z@txt.voice.google.com"
 
@@ -136,11 +142,13 @@ def test_agent_cmd_env_overrides_config():
         w.configure({"allowed_senders": ["5555550123"], "gv_number": "5555550100",
                      "google_account_email": "you@example.com", "agent_cmd": FAKE_CLAUDE})
 
-def test_claude_runner_resumes_session():
+def test_claude_runner_forks_last_session():
     st = {}
     assert w.run_job(st, "hi") == "claude:hi"
     assert st["sessions"]["primary:claude"] == "sess-1"
     assert w.run_job(st, "again") == "claude:again"
+    # follow-ups fork the last finished session; the newest finisher becomes the base
+    assert st["sessions"]["primary:claude"] == "fork-sess-1", st
 
 def test_codex_runner_resumes_thread():
     old = w.AGENT
@@ -150,6 +158,21 @@ def test_codex_runner_resumes_thread():
         assert w.run_job(st, "first") == "codex:thread-1:first", st
         assert st["sessions"]["primary:codex"] == "thread-1"
         assert w.run_job(st, "second") == "codex:thread-1:second"
+    finally:
+        w.AGENT = old
+
+def test_codex_parallel_job_gets_fresh_thread():
+    # while one job holds the Codex thread, another starts fresh and leaves the base alone
+    old = w.AGENT
+    w.AGENT = w.resolve_agent(FAKE_CODEX)
+    try:
+        st = {"sessions": {"primary:codex": "thread-old"}}
+        w.HELD["primary:codex"] = 1
+        assert w.run_job(st, "par") == "codex:thread-1:par"
+        assert st["sessions"]["primary:codex"] == "thread-old" and w.HELD["primary:codex"] == 1
+        w.HELD.pop("primary:codex")
+        assert w.run_job(st, "next") == "codex:thread-old:next"
+        assert not w.HELD
     finally:
         w.AGENT = old
 
@@ -169,6 +192,98 @@ def test_child_env_drops_outer_claude_session():
     try: assert "CLAUDECODE" not in w.child_env()
     finally: del os.environ["CLAUDECODE"]
     assert "/opt/homebrew/bin" in w.child_env()["PATH"]
+
+# Parallel jobs: real fake-CLI processes, stubbed texting.
+replies = []
+def wait_for(cond, timeout=15):
+    end = time.time() + timeout
+    while time.time() < end:
+        if cond(): return True
+        time.sleep(0.05)
+    return False
+
+def with_stub_send(fn):
+    def wrapped():
+        old = w.send_reply
+        w.send_reply = lambda hx, t, digits=None: replies.append(t)
+        replies.clear()
+        try: fn()
+        finally:
+            w.stop_all(); wait_for(w.idle)
+            w.send_reply = old
+    wrapped.__name__ = fn.__name__
+    return wrapped
+
+@with_stub_send
+def test_parallel_jobs_each_reply():
+    st = {}
+    w.dispatch(st, "first ask", "h1")
+    w.dispatch(st, "second ask", "h2")
+    assert wait_for(w.idle), w.RUNNING
+    acks = [r for r in replies if r.startswith("\U0001F44D")]
+    answers = sorted(r for r in replies if r not in acks)
+    assert acks[0] == "\U0001F44D on it", replies
+    assert acks[1] in ("\U0001F44D on it (running alongside 1 other task)",
+                       "\U0001F44D on it"), replies          # the first may already be done
+    assert answers == ["claude:first ask", "claude:second ask"], replies
+
+@with_stub_send
+def test_parallel_status_cap_and_stop():
+    old_max = w.MAX_PARALLEL
+    w.MAX_PARALLEL = 2
+    try:
+        st = {}
+        w.dispatch(st, "SLOW one", "h1")
+        w.dispatch(st, "SLOW two", "h2")
+        assert replies == ["👍 on it", "👍 on it (running alongside 1 other task)"], replies
+        assert wait_for(lambda: all(j["proc"] for j in list(w.RUNNING.values()))), w.RUNNING
+        procs = [j["proc"] for j in w.RUNNING.values()]
+        # the later job is told what the other one is doing
+        jids = sorted(w.RUNNING)
+        note = w.build_prompt(jids[1], "SLOW two").split("Other agents", 1)[1]
+        assert "- SLOW one" in note and "- SLOW two" not in note, note
+        w.dispatch(st, "status", "h3")
+        lines = replies[-1].splitlines()
+        assert lines[0] == "2 running:" and lines[1] == "• 0 min - SLOW one" \
+            and lines[2] == "• 0 min - SLOW two", replies[-1]
+        w.dispatch(st, "third", "h4")                  # over the cap: refused, nothing started
+        assert "that's my max" in replies[-1] and len(w.RUNNING) == 2, replies[-1]
+        assert not w.idle()
+        w.dispatch(st, "stop", "h5")
+        assert replies[-1] == "Stopped 2 tasks.", replies[-1]
+        assert wait_for(w.idle), w.RUNNING
+        assert all(p.poll() is not None for p in procs)    # processes really killed
+        time.sleep(0.2)
+        assert replies[-1] == "Stopped 2 tasks.", replies  # stopped jobs send no reply
+        w.dispatch(st, "status", "h6")
+        assert replies[-1] == "Here. Nothing running."
+        w.dispatch(st, "stop", "h7")
+        assert replies[-1] == "Nothing running."
+    finally:
+        w.MAX_PARALLEL = old_max
+
+@with_stub_send
+def test_heartbeat_pings_each_long_job_once():
+    w.RUNNING[901] = w.new_job("long task", "h1")
+    w.RUNNING[902] = w.new_job("short task", "h2")
+    w.RUNNING[901]["start"] -= 700
+    try:
+        w.heartbeat_once(); w.heartbeat_once()
+        assert len(replies) == 1 and replies[0].startswith("Still on it: long task"), replies
+    finally:
+        w.RUNNING.pop(901); w.RUNNING.pop(902)
+
+def test_max_parallel_config():
+    base = {"allowed_senders": ["5555550123"], "gv_number": "5555550100",
+            "google_account_email": "you@example.com", "agent_cmd": FAKE_CLAUDE}
+    try:
+        w.configure(dict(base, max_parallel=3)); assert w.MAX_PARALLEL == 3
+        try: w.configure(dict(base, max_parallel=0))
+        except w.ConfigError as ex: assert "max_parallel" in str(ex)
+        else: raise AssertionError("max_parallel 0 accepted")
+    finally:
+        w.configure(base)
+    assert w.MAX_PARALLEL == 6
 
 for name, fn in list(globals().items()):
     if name.startswith("test_"): fn(); print("ok", name)

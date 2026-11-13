@@ -4,9 +4,9 @@
 Flow: you text your Google Voice number. Google Voice forwards the text to your Gmail
 inbox. This script reads that inbox through a dedicated tab in your logged-in Chrome
 (JXA -> JavaScript in the tab), runs the agent CLI (`claude -p`, `codex exec`, or any
-command you set) in a resumed session, and replies through the Google Voice web app. If
-that fails it replies to the Google Voice email instead, which Google Voice delivers back
-as a text in the same thread.
+command you set) as one process per text, several in parallel, and replies through the
+Google Voice web app. If that fails it replies to the Google Voice email instead, which
+Google Voice delivers back as a text in the same thread.
 
 All personal values (phone numbers, account email, paths, model) live in config.json,
 next to this file. Create it with `python3 watcher.py --init ...` (see README).
@@ -17,7 +17,7 @@ next to this file. Create it with `python3 watcher.py --init ...` (see README).
   python3 watcher.py --prime     mark existing texts as seen (also done on first run)
   python3 watcher.py             run the watcher (run.sh does this and restarts it)
 """
-import json, os, re, subprocess, sys, time, html, datetime, pathlib, threading, queue, signal, hashlib
+import json, os, re, subprocess, sys, time, html, datetime, pathlib, threading, signal, hashlib
 import shlex, shutil, tempfile, argparse
 
 HOME = pathlib.Path.home()
@@ -46,6 +46,7 @@ AGENT_CWD = str(HOME)
 MODEL = "opus"         # Claude only; for Codex put -m <model> in agent_cmd
 EFFORT = "high"        # Claude only
 PERMISSION_MODE = "auto"  # Claude only
+MAX_PARALLEL = 6       # agent processes allowed to run at once
 POLL = 4
 SETTLE = 5             # wait for rapid-fire texts, then batch
 JOB_TIMEOUT = 3600
@@ -129,7 +130,7 @@ def configure(cfg):
     """Validate a config dict and set the module globals from it."""
     global ALLOWED, CLAUDE_GV, GV_ACCOUNT, REPLY_FROM, GMAIL_U, GV_U, TAB_URL, CHROME_APP, \
         CHROME_PROFILE, AGENT, FALLBACK, AGENT_CWD, MODEL, EFFORT, PERMISSION_MODE, POLL, SETTLE, \
-        JOB_TIMEOUT, SYSTEM
+        JOB_TIMEOUT, SYSTEM, MAX_PARALLEL
     errs = []
     allowed = [_digits(x)[-10:] for x in cfg.get("allowed_senders") or []]
     if not allowed or any(len(x) != 10 for x in allowed):
@@ -148,6 +149,11 @@ def configure(cfg):
             fallback = resolve_agent(cfg["fallback_agent_cmd"])
     except ConfigError as ex:
         errs.append(str(ex))
+    try:
+        maxp = int(cfg.get("max_parallel", 6))
+        if maxp < 1: raise ValueError
+    except (TypeError, ValueError):
+        errs.append('"max_parallel" must be a whole number, 1 or more'); maxp = 6
     if errs:
         raise ConfigError("Bad config:\n  " + "\n  ".join(errs))
     ALLOWED = allowed
@@ -167,6 +173,7 @@ def configure(cfg):
     POLL = float(cfg.get("poll_seconds", 4))
     SETTLE = float(cfg.get("settle_seconds", 5))
     JOB_TIMEOUT = int(cfg.get("job_timeout_seconds", 3600))
+    MAX_PARALLEL = maxp
     extra = (cfg.get("system_prompt_extra") or "").strip()
     SYSTEM = BASE_SYSTEM + (extra + "\n" if extra else "")
 
@@ -408,7 +415,15 @@ def send_reply(hexid, text, digits=None):
 
 LIMIT_RE = re.compile(r"usage limit|limit reached|out of (extra )?usage|rate.?limit|quota|429|credit balance", re.I)
 
-CUR = {"proc": None, "prompt": "", "start": 0, "stopped": False}
+# One agent process per incoming text, several at once. Each entry:
+# {"proc", "prompt", "start", "stopped", "hex", "pinged"}
+RUNNING = {}
+RLOCK = threading.RLock()
+NEXT_ID = [0]
+
+def new_job(prompt="", hexid=None):
+    return {"proc": None, "prompt": prompt, "start": time.time(), "stopped": False,
+            "hex": hexid, "pinged": False}
 
 def child_env():
     """Environment for the agent CLI: a PATH that finds node/homebrew tools even when the
@@ -420,21 +435,26 @@ def child_env():
         env.pop(k, None)
     return env
 
-def run(cmd):
+def run(cmd, job):
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                          cwd=AGENT_CWD, env=child_env(), start_new_session=True)
-    CUR["proc"] = p
+    job["proc"] = p
+    if job["stopped"]:                   # "stop" arrived while the process was starting
+        try: os.killpg(p.pid, signal.SIGTERM)
+        except Exception: pass
     try: out, err = p.communicate(timeout=JOB_TIMEOUT)
     except subprocess.TimeoutExpired:
         os.killpg(p.pid, signal.SIGTERM); out, err = p.communicate()
-    CUR["proc"] = None
+    job["proc"] = None
     return p.returncode, out or "", err or ""
 
 def _has(argv, *flags):
     return any(a == f or a.startswith(f + "=") for a in argv for f in flags)
 
-def run_claude(agent, sessions, key, prompt):
-    """`claude -p ... --output-format json`, resuming the same session every time."""
+def run_claude(agent, sessions, key, prompt, job):
+    """`claude -p ... --output-format json`. Each job forks the last finished conversation
+    (`--resume <id> --fork-session`), so it knows the recent back-and-forth but runs
+    independently of the other jobs. The newest finisher's session becomes the next base."""
     argv = agent["argv"]
     cmd = argv + ["-p", prompt, "--output-format", "json"]
     if not _has(argv, "--permission-mode", "--dangerously-skip-permissions"):
@@ -442,77 +462,96 @@ def run_claude(agent, sessions, key, prompt):
     if not _has(argv, "--model"): cmd += ["--model", MODEL]
     if not _has(argv, "--effort"): cmd += ["--effort", EFFORT]
     cmd += ["--append-system-prompt", SYSTEM]
-    if sessions.get(key): cmd += ["--resume", sessions[key]]
-    rc, out, err = run(cmd)
+    with SLOCK: base = sessions.get(key)
+    if base: cmd += ["--resume", base, "--fork-session"]
+    rc, out, err = run(cmd, job)
     j = None
     try: j = json.loads(out)
     except Exception: pass
-    if j and j.get("session_id"): sessions[key] = j["session_id"]
+    if not isinstance(j, dict): j = None
+    if j and j.get("session_id"):
+        with SLOCK: sessions[key] = j["session_id"]
     text = ((j or {}).get("result") or "").strip()
     failed = bool((j is None) or j.get("is_error") or rc != 0)
-    if failed and sessions.get(key) and "resume" in err.lower():
-        sessions[key] = None
+    if failed and base and "resume" in err.lower():
+        with SLOCK:
+            if sessions.get(key) == base: sessions[key] = None
     return text, failed, (text + " " + err + " " + (out if j is None else "")).strip()
 
-def run_codex(agent, sessions, key, prompt):
+HELD = {}   # session key -> job count holding that Codex thread
+
+def run_codex(agent, sessions, key, prompt, job):
     """`codex exec --json -o <file>`; the first run starts a thread, later runs use
-    `codex exec resume <thread_id>`. Codex has no system-prompt flag, so the house rules
-    go at the top of the first message of each thread."""
+    `codex exec resume <thread_id>`. Two processes must not write one Codex thread at once,
+    and the watcher does not fork Codex threads, so a job that starts while another job holds
+    the thread starts a fresh thread (without the earlier conversation) and that thread is
+    dropped when it ends. Codex has no system-prompt flag, so the house rules go at the top
+    of the first message of each thread."""
     argv = agent["argv"]
+    with SLOCK:
+        owner = not HELD.get(key)
+        sid = sessions.get(key) if owner else None
+        if owner: HELD[key] = 1
     fd, last = tempfile.mkstemp(prefix="instinct-", suffix=".txt"); os.close(fd)
     cmd = list(argv)
     if not _has(argv, "--skip-git-repo-check"): cmd += ["--skip-git-repo-check"]
     if not _has(argv, "--sandbox", "-s", "--dangerously-bypass-approvals-and-sandbox"):
         cmd += ["--sandbox", "workspace-write"]
     cmd += ["--json", "-o", last]
-    sid = sessions.get(key)
     cmd += ["resume", sid, prompt] if sid else [SYSTEM + "\n---\n" + prompt]
     try:
-        rc, out, err = run(cmd)
+        rc, out, err = run(cmd, job)
         text = pathlib.Path(last).read_text().strip() if os.path.exists(last) else ""
     finally:
         try: os.unlink(last)
         except OSError: pass
+        if owner:
+            with SLOCK: HELD.pop(key, None)
     errors = []
     for line in out.splitlines():
         try: e = json.loads(line)
         except Exception: continue
         if not isinstance(e, dict): continue
-        if e.get("type") == "thread.started" and e.get("thread_id"): sessions[key] = e["thread_id"]
+        if e.get("type") == "thread.started" and e.get("thread_id"):
+            if owner:
+                with SLOCK: sessions[key] = e["thread_id"]
         elif e.get("type") == "error": errors.append(str(e.get("message", "")))
         elif e.get("type") == "turn.failed": errors.append(str((e.get("error") or {}).get("message", "")))
     failed = rc != 0 or (not text and bool(errors))
     blob = (" ".join(errors) + " " + err).strip()
     if failed and sid and re.search(r"resume|not found|no (such )?(session|thread)", blob, re.I):
-        sessions[key] = None
+        with SLOCK:
+            if sessions.get(key) == sid: sessions[key] = None
     return text, failed, blob or out[-300:]
 
-def run_custom(agent, sessions, key, prompt):
+def run_custom(agent, sessions, key, prompt, job):
     """Any other CLI: the prompt (with the house rules on top) replaces a {prompt} argument,
-    or is added as the last argument. Its stdout is the answer. No session memory."""
+    or is added as the last argument. Its stdout is the answer. No session memory, so
+    parallel jobs need nothing special."""
     full = SYSTEM + "\n---\n" + prompt
     argv = agent["argv"]
     cmd = [a.replace("{prompt}", full) for a in argv] if any("{prompt}" in a for a in argv) else argv + [full]
-    rc, out, err = run(cmd)
+    rc, out, err = run(cmd, job)
     text = out.strip()
     return text, rc != 0, (err + " " + text).strip()
 
 RUNNERS = {"claude": run_claude, "codex": run_codex, "custom": run_custom}
 
-def run_agent(agent, role, state, prompt):
-    sessions = state.setdefault("sessions", {})
-    return RUNNERS[agent["kind"]](agent, sessions, role + ":" + agent["kind"], prompt)
+def run_agent(agent, role, state, prompt, job):
+    with SLOCK: sessions = state.setdefault("sessions", {})
+    return RUNNERS[agent["kind"]](agent, sessions, role + ":" + agent["kind"], prompt, job)
 
-def run_job(state, prompt):
+def run_job(state, prompt, job=None):
     """Run the prompt through the agent. Returns the reply text, or None if stopped."""
-    text, failed, blob = run_agent(AGENT, "primary", state, prompt)
-    if CUR["stopped"]: return None
+    job = job if job is not None else new_job(prompt)
+    text, failed, blob = run_agent(AGENT, "primary", state, prompt, job)
+    if job["stopped"]: return None
     name = AGENT["name"]
     if failed and LIMIT_RE.search(blob):
         if FALLBACK:
             log("%s out of usage -> falling back to %s" % (name, FALLBACK["name"]))
-            alt, alt_failed, alt_blob = run_agent(FALLBACK, "fallback", state, prompt)
-            if CUR["stopped"]: return None
+            alt, alt_failed, alt_blob = run_agent(FALLBACK, "fallback", state, prompt, job)
+            if job["stopped"]: return None
             if alt and not alt_failed: return "(via %s) %s" % (FALLBACK["name"], alt)
             return "%s is out of usage and %s failed too: %s" % (name, FALLBACK["name"], alt_blob[-200:])
         return "%s is out of usage right now. Try again later." % name
@@ -520,47 +559,72 @@ def run_job(state, prompt):
         return "Hit an error running that: " + (text or blob)[-300:]
     return text or "Done (no text output)."
 
-JOBS = queue.Queue()
+def others(jid):
+    """Texts other jobs are still working on."""
+    with RLOCK:
+        return [j["prompt"][:160] for k, j in RUNNING.items() if k != jid]
 
-def worker(state):
-    while True:
-        body, hexid = JOBS.get()
-        batch = [body]
-        while not JOBS.empty():              # fold queued follow-ups into one prompt
-            b, hexid = JOBS.get(); batch.append(b)
-        prompt = "[Text(s) from the owner, %s]\n" % datetime.datetime.now().strftime("%a %b %-d %-I:%M %p") + "\n\n".join(batch)
-        CUR.update(prompt=prompt, start=time.time(), stopped=False); LAST_HEX[0] = hexid
-        try:
-            answer = run_job(state, prompt); save(state)
-            if answer is None:
-                log("job stopped"); continue
-            log("REPLY:", repr(answer[:300]))
-            send_reply(hexid, answer)
-        except Exception as ex:
-            log("job error:", ex)
-            try: send_reply(hexid, "Something broke on my end: %s" % str(ex)[:200])
+def build_prompt(jid, body):
+    par = others(jid)
+    note = ""
+    if par:
+        note = ("\n\n[Other agents are working on these earlier texts in parallel right now. Do only "
+                "what this text asks; don't redo their work:]\n" + "\n".join("- " + x for x in par))
+    return "[Text(s) from the owner, %s]\n" % datetime.datetime.now().strftime("%a %b %-d %-I:%M %p") + body + note
+
+def job_thread(state, jid, body, hexid):
+    with RLOCK: job = RUNNING[jid]
+    try:
+        answer = run_job(state, build_prompt(jid, body), job); save(state)
+        if answer is None:
+            log("job %d stopped" % jid); return
+        log("REPLY #%d:" % jid, repr(answer[:300]))
+        send_reply(hexid, answer)
+    except Exception as ex:
+        log("job %d error:" % jid, ex)
+        try: send_reply(hexid, "Something broke on my end: %s" % str(ex)[:200])
+        except Exception: pass
+    finally:
+        with RLOCK: RUNNING.pop(jid, None)
+
+def start_job(state, body, hexid):
+    with RLOCK:
+        NEXT_ID[0] += 1; jid = NEXT_ID[0]
+        RUNNING[jid] = new_job(body, hexid)
+    threading.Thread(target=job_thread, args=(state, jid, body, hexid), daemon=True).start()
+    return jid
+
+def stop_all():
+    """Kill every running job. Returns how many there were."""
+    with RLOCK: jobs = list(RUNNING.values())
+    for j in jobs:
+        j["stopped"] = True
+        p = j["proc"]
+        if p:
+            try: os.killpg(p.pid, signal.SIGTERM)
             except Exception: pass
-        finally:
-            CUR.update(prompt="", start=0)
+    return len(jobs)
+
+def idle():
+    with RLOCK: return not RUNNING
+
+def plural(n, word):
+    return "%d %s%s" % (n, word, "" if n == 1 else "s")
 
 def control(body, hexid):
     """Text commands handled by the watcher itself. Returns True if handled."""
     c = body.strip().lower().rstrip(".!")
-    if c in ("stop", "cancel", "kill it", "stop it", "nevermind", "never mind"):
-        p = CUR["proc"]
-        while not JOBS.empty(): JOBS.get()
-        if p:
-            CUR["stopped"] = True
-            try: os.killpg(p.pid, signal.SIGTERM)
-            except Exception: pass
-            send_reply(hexid, "Stopped.")
-        else: send_reply(hexid, "Nothing running.")
+    if c in ("stop", "cancel", "kill it", "stop it", "nevermind", "never mind", "stop all"):
+        n = stop_all()
+        send_reply(hexid, ("Stopped %s." % plural(n, "task")) if n else "Nothing running.")
         return True
     if c in ("status", "?", "you there", "you there?"):
-        if CUR["start"]:
-            mins = int((time.time() - CUR["start"]) / 60)
-            msg = "Still working (%d min) on: %s" % (mins, CUR["prompt"][:200])
-            if JOBS.qsize(): msg += "\n%d more queued after it." % JOBS.qsize()
+        with RLOCK: jobs = sorted(RUNNING.values(), key=lambda j: j["start"])
+        if jobs:
+            lines = ["%d running:" % len(jobs)]
+            for j in jobs:
+                lines.append("• %d min - %s" % (int((time.time() - j["start"]) / 60), j["prompt"][:120]))
+            msg = "\n".join(lines)
         else: msg = "Here. Nothing running."
         send_reply(hexid, msg)
         return True
@@ -614,24 +678,34 @@ def tick(state):
     got += scan(state)
     body = "\n".join(b for b, _ in got); hx = got[-1][1]
     log("TEXT:", repr(body[:300]))
+    dispatch(state, body, hx)
+
+def dispatch(state, body, hx):
+    """A command, or a new job running alongside any others (up to MAX_PARALLEL)."""
     if control(body, hx): return
-    busy = bool(CUR["start"]) or not JOBS.empty()
-    JOBS.put((body, hx))
-    try: send_reply(hx, "👍 got it, I'll do that right after the current one" if busy else "👍 on it")
+    with RLOCK: n = len(RUNNING)
+    if n >= MAX_PARALLEL:
+        send_reply(hx, "%d tasks already running, that's my max. Text \"status\" to see them, "
+                       "then resend." % n)
+        return
+    jid = start_job(state, body, hx)
+    log("started job #%d (%d running)" % (jid, n + 1))
+    try: send_reply(hx, "👍 on it" + (" (running alongside %s)" % plural(n, "other task") if n else ""))
     except Exception as ex: log("ack failed:", ex)
 
-def heartbeat():
-    """Text a 'still working' note once if a job runs long."""
-    pinged = 0
-    while True:
-        time.sleep(30)
-        s = CUR["start"]
-        if s and s != pinged and time.time() - s > 600:
-            pinged = s
-            try: send_reply(LAST_HEX[0], "Still on it, taking a bit. Text \"status\" or \"stop\" anytime.")
+def heartbeat_once():
+    """Text a 'still working' note once per job that runs over 10 minutes."""
+    with RLOCK: jobs = list(RUNNING.values())
+    for j in jobs:
+        if not j["pinged"] and not j["stopped"] and time.time() - j["start"] > 600:
+            j["pinged"] = True
+            try: send_reply(j["hex"], "Still on it: %s\nText \"status\" or \"stop\" anytime." % j["prompt"][:80])
             except Exception as ex: log("heartbeat failed:", ex)
 
-LAST_HEX = [None]
+def heartbeat():
+    while True:
+        time.sleep(30)
+        heartbeat_once()
 
 def drain_outbox():
     """Other scripts (cron jobs, scheduled tasks) can text you by dropping .txt files in
@@ -772,8 +846,7 @@ def main():
     if a.prime: return prime(state)
     if "seen" not in state:     # first run: don't treat old texts as new requests
         prime(state)
-    log("watcher started (agent: %s)" % " ".join(AGENT["argv"]))
-    threading.Thread(target=worker, args=(state,), daemon=True).start()
+    log("watcher started (agent: %s, up to %d jobs in parallel)" % (" ".join(AGENT["argv"]), MAX_PARALLEL))
     threading.Thread(target=heartbeat, daemon=True).start()
     flag = DIR / "restart.flag"           # touch this to restart safely (run.sh relaunches)
     while True:
@@ -781,7 +854,7 @@ def main():
         except Exception as ex: log("error:", ex)
         try: drain_outbox()
         except Exception as ex: log("outbox error:", ex)
-        if flag.exists() and not CUR["start"] and JOBS.empty():
+        if flag.exists() and idle():
             flag.unlink(); log("restart requested, idle -> exiting"); os._exit(0)
         time.sleep(POLL)
 

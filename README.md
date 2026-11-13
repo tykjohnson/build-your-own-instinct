@@ -2,7 +2,8 @@
 
 Text your coding agent from your phone. You send a text to a Google Voice number, the agent
 (Claude Code by default, or Codex, or any CLI you point it at) runs the request on your Mac
-with your tools, files and skills, and texts you back the answer.
+with your tools, files and skills, and texts you back the answer. Each text gets its own
+agent process, so you can fire off several tasks and they run side by side.
 
 It is one Python script with no dependencies beyond the standard library. It drives your own
 logged-in Chrome, so there are no API keys, no Twilio account and no server.
@@ -99,9 +100,9 @@ Text your Google Voice number `status`. You should get "Here. Nothing running." 
                                          in a dedicated Chrome tab (JXA)
                                                             |
                                                             v
-                                         claude -p "<your text>" --resume <session>
+                                         claude -p "<your text>" --resume <last> --fork-session
                                          or: codex exec resume <thread> "<your text>"
-                                         (runs in a worker thread on your Mac)
+                                         (one process per text, up to 6 at once)
                                                             |
                                                             v
   your phone <---- SMS ---- Google Voice web app <---- reply typed into voice.google.com
@@ -114,8 +115,11 @@ Text your Google Voice number `status`. You should get "Here. Nothing running." 
    print view, so a text is caught even if Gmail already marked it read.
 3. Texts from numbers outside `allowed_senders` are logged and ignored.
 4. Texts that arrive within a few seconds of each other are batched into one prompt.
-   The watcher acks with "on it", then runs the agent in a worker thread, resuming the
-   same session each time so the agent remembers the conversation.
+   Each batch starts its own agent process in its own thread, alongside any that are
+   still running (up to `max_parallel`, default 6). The watcher acks with "on it", or
+   "on it (running alongside 2 other tasks)". Past the limit it says so and starts nothing;
+   resend once something finishes. The prompt lists the other texts still being worked on,
+   so agents don't duplicate each other's work.
 5. The answer is typed into the Google Voice web app in a second marked tab and sent. Long
    answers are split into up to four texts. If the web app fails, it replies to the Google
    Voice email in Gmail instead.
@@ -123,14 +127,32 @@ Text your Google Voice number `status`. You should get "Here. Nothing running." 
 On first start it marks every text already in Gmail as seen, so old texts are not run as
 new requests (`python3 watcher.py --prime` does the same by hand).
 
-Text `status` to see what it is working on, or `stop` to kill the current job. If a job
-runs over 10 minutes you get one "still on it" text.
+### Parallel tasks and memory
+
+- **Claude:** every job runs `--resume <last finished session> --fork-session`, so it knows
+  the recent back-and-forth but writes to its own copy of the conversation. When a job
+  finishes, its session becomes the base for the next one (the newest finisher wins), so a
+  "yes" to a question still lands in a session that remembers asking it.
+- **Codex:** `codex exec` has no fork option the watcher uses, and two processes must not
+  write one thread at once. A job resumes the shared thread when no other job holds it.
+  A job that starts while another holds it gets a fresh thread with the house rules but
+  without the earlier conversation, and that thread is dropped when it ends.
+- **Other CLIs** keep no session memory, so each job is independent anyway.
+
+### Text commands
+
+| Text | What happens |
+| --- | --- |
+| `status` (or `?`) | Lists every running task with its minutes so far, e.g. `2 running:` then `• 4 min - draft the reply`. "Here. Nothing running." when idle. |
+| `stop` (or `cancel`, `stop all`, `never mind`) | Kills every running task and replies "Stopped 2 tasks." Stopped tasks send no answer. |
+
+Each task that runs over 10 minutes sends one "Still on it: <its text>" note.
 
 Other scripts on your Mac can text you too: drop a `.txt` file into `outbox/` and the
 watcher sends it to the first number in `allowed_senders`, then renames it to `.sent`.
 
-To restart safely after editing the script, `touch restart.flag`. The watcher exits once it
-is idle and `run.sh` starts the new code.
+To restart safely after editing the script, `touch restart.flag`. The watcher exits once no
+tasks are running and `run.sh` starts the new code.
 
 ## Requirements
 
@@ -151,7 +173,7 @@ short PATH. A full path always works.
 
 | `agent_cmd` | What runs |
 | --- | --- |
-| `claude` (default) | `claude -p <text> --output-format json --resume <session>` with `model`, `effort`, `permission_mode` and the built-in system prompt. Extra flags you add (`claude --model sonnet`) are kept and win over the config. |
+| `claude` (default) | `claude -p <text> --output-format json --resume <session> --fork-session` with `model`, `effort`, `permission_mode` and the built-in system prompt. Extra flags you add (`claude --model sonnet`) are kept and win over the config. |
 | `codex exec` | `codex exec --skip-git-repo-check --sandbox workspace-write --json -o <file> <text>`, then `codex exec ... resume <thread_id> <text>` for follow-ups. Add `-m <model>` or your own `--sandbox` to the command to change those. The house rules go at the top of the first message of each thread, since Codex has no system-prompt flag. |
 | anything else | Your command with the prompt in place of a `{prompt}` argument, or added as the last argument. Its stdout is the reply. No session memory. |
 
@@ -179,6 +201,7 @@ required value is wrong.
 | `permission_mode` | no | Claude only: passed to `claude --permission-mode`. See Safety. |
 | `fallback_agent_cmd` | no | Second agent to try when the first is out of usage. `null` to disable. |
 | `poll_seconds`, `settle_seconds`, `job_timeout_seconds` | no | Poll interval, batching window, and the per-job time limit. |
+| `max_parallel` | no | How many agent processes may run at once. Default 6. Texts past the limit are refused with a note, not queued. |
 | `system_prompt_extra` | no | Your own lines appended to the built-in system prompt (house rules, tone, tools to prefer). |
 
 ## Gotchas
@@ -227,8 +250,9 @@ required value is wrong.
   for more than 10 minutes, and retries once after a reload.
 - US numbers only (the Voice URL is built with `+1`).
 - Built for one owner. Replies go to the first number in `allowed_senders`.
-- Jobs run one at a time. Texts that arrive during a job are queued and folded into the
-  next prompt.
+- Parallel jobs share one Mac. Two tasks that edit the same files can collide; the prompt
+  tells each agent what the others are doing, but nothing locks files.
+- Parallel jobs use your agent's usage limits faster.
 
 Run the offline tests (no Chrome, no config, no texts sent, fake agent CLIs) with
 `python3 test_watcher.py`.
