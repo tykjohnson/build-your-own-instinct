@@ -51,6 +51,11 @@ POLL = 4
 SETTLE = 5             # wait for rapid-fire texts, then batch
 JOB_TIMEOUT = 3600
 SYSTEM = ""
+AUTO_RESTART = True    # restart a frozen Chrome when nobody is using the Mac
+RESTART_AFTER = 600    # Chrome frozen this long (seconds) ...
+IDLE_NEEDED = 600      # ... and no keyboard/mouse input this long -> restart Chrome
+AFTER_RESTART = None   # optional script to run after an auto-restart
+ALERT_IMESSAGE = None  # optional iMessage handle for "Chrome is stuck" alerts
 
 BASE_SYSTEM = """You are a coding agent running on the owner's Mac, reached by text message
 through a Google Voice number. Your final answer is sent back to them as a text.
@@ -73,6 +78,11 @@ through a Google Voice number. Your final answer is sent back to them as a text.
   short lines, a blank line between sections. Never a wall of text.
 - Lists over text: bulleted with "•", one item per line, "Name - short detail". No group
   headers, no parentheticals, no comma-run blobs of names.
+- Chrome automation: a JavaScript popup (alert, confirm, "Leave site?") left open in any tab
+  freezes ALL Chrome automation, including this text line. Before a click that may open one
+  (delete, end listing, leave page), stub them in that tab first, e.g.
+  window.confirm=()=>true; window.alert=()=>{}; window.onbeforeunload=null, and close tabs
+  you opened. If Chrome stops answering, say so in your reply instead of retrying.
 """
 
 class ConfigError(Exception):
@@ -130,7 +140,8 @@ def configure(cfg):
     """Validate a config dict and set the module globals from it."""
     global ALLOWED, CLAUDE_GV, GV_ACCOUNT, REPLY_FROM, GMAIL_U, GV_U, TAB_URL, CHROME_APP, \
         CHROME_PROFILE, AGENT, FALLBACK, AGENT_CWD, MODEL, EFFORT, PERMISSION_MODE, POLL, SETTLE, \
-        JOB_TIMEOUT, SYSTEM, MAX_PARALLEL
+        JOB_TIMEOUT, SYSTEM, MAX_PARALLEL, AUTO_RESTART, RESTART_AFTER, IDLE_NEEDED, AFTER_RESTART, \
+        ALERT_IMESSAGE
     errs = []
     allowed = [_digits(x)[-10:] for x in cfg.get("allowed_senders") or []]
     if not allowed or any(len(x) != 10 for x in allowed):
@@ -154,6 +165,13 @@ def configure(cfg):
         if maxp < 1: raise ValueError
     except (TypeError, ValueError):
         errs.append('"max_parallel" must be a whole number, 1 or more'); maxp = 6
+    secs = {}
+    for k in ("restart_after_seconds", "idle_needed_seconds"):
+        try:
+            secs[k] = float(cfg.get(k) if cfg.get(k) is not None else 600)
+            if secs[k] < 0: raise ValueError
+        except (TypeError, ValueError):
+            errs.append('"%s" must be a number of seconds' % k); secs[k] = 600
     if errs:
         raise ConfigError("Bad config:\n  " + "\n  ".join(errs))
     ALLOWED = allowed
@@ -174,6 +192,11 @@ def configure(cfg):
     SETTLE = float(cfg.get("settle_seconds", 5))
     JOB_TIMEOUT = int(cfg.get("job_timeout_seconds", 3600))
     MAX_PARALLEL = maxp
+    AUTO_RESTART = cfg.get("auto_restart_chrome", True) is not False
+    RESTART_AFTER = secs["restart_after_seconds"]
+    IDLE_NEEDED = secs["idle_needed_seconds"]
+    AFTER_RESTART = _path(cfg["after_chrome_restart"]) if cfg.get("after_chrome_restart") else None
+    ALERT_IMESSAGE = str(cfg.get("alert_imessage") or "").strip() or None
     extra = (cfg.get("system_prompt_extra") or "").strip()
     SYSTEM = BASE_SYSTEM + (extra + "\n" if extra else "")
 
@@ -238,14 +261,119 @@ def dedupe_tabs(mark):
         try: jxa("c.windows.byId(%s).tabs.byId(%s).close()" % (w, tid))
         except Exception: pass
 
+# Frozen Chrome. A JavaScript popup (alert, confirm, "Leave site?") left open in any tab blocks
+# every Apple Events call to Chrome, so the JXA lookup times out. A timeout does not mean the
+# tab is gone: opening a new one each poll piles up dozens of Gmail tabs. So while Chrome is
+# frozen the watcher opens nothing. After RESTART_AFTER seconds it restarts Chrome if nobody is
+# using the Mac, or sends one alert if someone is.
+STUCK = {"since": 0, "alerted": False, "restarted": 0}
+AFTER_LOG = DIR / "after-restart.log"
+LAST_HEX = [None]      # newest GV thread seen, for the email fallback of the restart notice
+
+def _sleep(s):         # tests stub this
+    time.sleep(s)
+
+def hid_idle():
+    """Seconds since anyone touched this Mac's keyboard, mouse or trackpad (0 if unknown)."""
+    try:
+        out = subprocess.run(["ioreg", "-c", "IOHIDSystem"], capture_output=True, text=True, timeout=10).stdout
+        m = re.search(r'"HIDIdleTime" = (\d+)', out)
+        return int(m.group(1)) / 1e9 if m else 0
+    except Exception:
+        return 0
+
+def chrome_bundle():
+    """The .app folder of chrome_app, for `open -a`."""
+    i = CHROME_APP.find(".app/")
+    return CHROME_APP[:i + 4] if i >= 0 else "Google Chrome"
+
+def _hhmm(t):
+    return time.strftime("%-I:%M %p", time.localtime(t))
+
+def restart_chrome():
+    """Quit the frozen Chrome (SIGTERM, so it restores its tabs on relaunch), force it only if
+    it ignores that, relaunch it, wait until it answers, run the optional hook, and text the
+    owner through the normal reply path."""
+    pid = chrome_pid()
+    since = STUCK["since"]
+    log("auto-restarting Chrome (pid %d), frozen since %s" % (pid, _hhmm(since)))
+    STUCK["restarted"] = time.time()
+    os.kill(pid, signal.SIGTERM)
+    for _ in range(45):
+        _sleep(1)
+        try: os.kill(pid, 0)
+        except OSError: break
+    else:
+        log("Chrome ignored SIGTERM, forcing"); os.kill(pid, signal.SIGKILL); _sleep(3)
+    subprocess.Popen(["open", "-a", chrome_bundle()])
+    for _ in range(24):                                   # up to 2 min to answer again
+        _sleep(5)
+        try: jxa("c.windows().length"); break
+        except Exception: pass
+    else:
+        log("Chrome still not answering after restart"); return False
+    STUCK.update(since=0, alerted=False)
+    log("Chrome back after restart")
+    if AFTER_RESTART:
+        if os.path.exists(AFTER_RESTART):
+            argv = [AFTER_RESTART] if os.access(AFTER_RESTART, os.X_OK) else ["/bin/bash", AFTER_RESTART]
+            with open(AFTER_LOG, "a") as out:
+                subprocess.Popen(argv, stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+        else:
+            log("after_chrome_restart hook not found:", AFTER_RESTART)
+    _sleep(25)                                            # let Chrome and the hook settle
+    try:
+        send_reply(LAST_HEX[0], "Heads up: Chrome stopped answering at %s, so I restarted it at %s. "
+                   "The text line is back up. If a text got no reply, send it again."
+                   % (_hhmm(since), _hhmm(time.time())))
+    except Exception as ex: log("restart notice failed:", ex)
+    return True
+
+def stuck_alert(msg):
+    """Chrome is frozen, so the Google Voice tab can't send. Use iMessage if configured."""
+    if not ALERT_IMESSAGE:
+        log("ALERT (set alert_imessage in config.json to get this as an iMessage):", msg); return
+    try:
+        subprocess.run(["osascript", "-e", 'tell application "Messages" to send %s to participant %s of '
+                        '(1st account whose service type = iMessage)' % (json.dumps(msg), json.dumps(ALERT_IMESSAGE))],
+                       capture_output=True, timeout=90)
+        log("sent Chrome-stuck alert via iMessage")
+    except Exception as ex: log("stuck alert failed:", ex)
+
+def chrome_stuck():
+    """Called when a JXA call to Chrome times out. Never opens tabs. Always raises."""
+    now = time.time()
+    if not STUCK["since"]:
+        STUCK["since"] = now; log("Chrome not answering automation")
+    frozen = now - STUCK["since"]
+    if frozen > RESTART_AFTER:
+        recent = now - STUCK["restarted"] < 1800
+        if AUTO_RESTART and not recent and hid_idle() > IDLE_NEEDED:
+            try: restart_chrome()
+            except Exception as ex: log("auto-restart failed:", ex)
+            raise RuntimeError("Chrome was restarted")
+        if not STUCK["alerted"]:
+            STUCK["alerted"] = True
+            why = ("Auto-restart is off." if not AUTO_RESTART else
+                   "I already restarted it in the last 30 minutes." if recent else
+                   "Someone is using the Mac, so I didn't restart it.")
+            stuck_alert("Text line is down: Chrome stopped answering automation at %s. %s Quit and "
+                        "reopen Chrome and it comes back on its own." % (_hhmm(STUCK["since"]), why))
+    _sleep(30)
+    raise RuntimeError("Chrome not answering automation")
+
 def ensure_tab(mark=MARK, url=None):
     url = url or TAB_URL
     for _ in range(3):
         try:
             t = find_tab(mark)
+            if STUCK["since"]:
+                log("Chrome answering again"); STUCK.update(since=0, alerted=False)
             if t:
                 dedupe_tabs(mark)
                 return t
+        except subprocess.TimeoutExpired:
+            chrome_stuck()                   # raises: a frozen Chrome gets no new tabs
         except Exception:
             pass
         time.sleep(1)
@@ -651,23 +779,33 @@ def thread_msgs(hx):
         out.append((addr, date, body, hashlib.sha1((base + "|%d" % seen[base]).encode()).hexdigest()[:16]))
     return out
 
+KEEP_HEXES = 4
+
 def scan(state):
-    """New texts to your GV number: [(body, thread_hex)]. Reads whole threads, so a text
-    that Gmail marked read (we opened the thread to reply) is still caught."""
-    threads = state.setdefault("threads", {})           # GV conversation addr -> latest thread hex
+    """New texts to your GV number: [(body, thread_hex, date)]. Reads whole threads, so a text
+    that Gmail marked read (we opened the thread to reply) is still caught.
+    Gmail splits one Google Voice conversation into several threads over time, and the feed
+    can list an older thread after a newer one. So it watches the few newest thread hexes
+    (newest first, kept in state), not one hex per conversation."""
+    hexes = state.setdefault("gv_hexes", [])
+    for hx in (state.pop("threads", None) or {}).values():   # migrate the old one-per-address map
+        if hx not in hexes: hexes.append(hx)
     seen = state.setdefault("seen", [])
+    fresh = []
     for e in json.loads(js(feed_js()) or "[]"):
         if e["email"].startswith(CLAUDE_GV + ".") and e["email"].endswith("txt.voice.google.com"):
-            threads[e["email"]] = e["hex"]
+            if e["hex"] and e["hex"] not in fresh: fresh.append(e["hex"])
+    hexes[:] = (fresh + [h for h in hexes if h not in fresh])[:KEEP_HEXES]
+    if hexes: LAST_HEX[0] = hexes[0]
     out = []
-    for addr, hx in list(threads.items()):
+    for hx in reversed(hexes):               # oldest thread first, so texts come out in order
         for a, date, body, key in thread_msgs(hx):
             if key in seen or not a.startswith(CLAUDE_GV + "."): continue
             seen.append(key)
             digits = a.split("@")[0].split(".")[1][-10:]
             if digits not in ALLOWED:
                 log("ignored text from a number not in allowed_senders:", repr(body[:60])); continue
-            out.append((body, hx))
+            out.append((body, hx, date))
     state["seen"] = seen[-2000:]; save(state)
     return out
 
@@ -676,9 +814,28 @@ def tick(state):
     if not got: return
     time.sleep(SETTLE)                       # let rapid-fire texts land, then batch them
     got += scan(state)
-    body = "\n".join(b for b, _ in got); hx = got[-1][1]
-    log("TEXT:", repr(body[:300]))
-    dispatch(state, body, hx)
+    for body, hx in group_texts(got):
+        log("TEXT:", repr(body[:300]))
+        dispatch(state, body, hx)
+
+def _minute(date):
+    """Parse a Gmail header date like "Thu, Nov 12, 2026 at 6:19 AM" (None if it can't)."""
+    try: return datetime.datetime.strptime(re.sub(r"\s*([AP]M)$", r" \1", date.strip()),
+                                           "%a, %b %d, %Y at %I:%M %p")
+    except Exception: return None
+
+def group_texts(got):
+    """[(body, hex, date)] -> [(body, hex)]. Texts sent within a minute of each other are one
+    task; a backlog of texts sent minutes apart (e.g. after the watcher was down) becomes one
+    task per text. Dates have minute precision, so "within a minute" means <= 60 seconds."""
+    groups = []
+    for body, hx, date in got:
+        t = _minute(date)
+        if groups and (t is None or groups[-1][2] is None or abs((t - groups[-1][2]).total_seconds()) <= 60):
+            groups[-1][0].append(body); groups[-1][1] = hx; groups[-1][2] = t or groups[-1][2]
+        else:
+            groups.append([[body], hx, t])
+    return [("\n".join(b), hx) for b, hx, _ in groups]
 
 def dispatch(state, body, hx):
     """A command, or a new job running alongside any others (up to MAX_PARALLEL)."""
@@ -690,7 +847,8 @@ def dispatch(state, body, hx):
         return
     jid = start_job(state, body, hx)
     log("started job #%d (%d running)" % (jid, n + 1))
-    try: send_reply(hx, "👍 on it" + (" (running alongside %s)" % plural(n, "other task") if n else ""))
+    try: send_reply(hx, "👍 on it: " + body.strip().split("\n")[0][:40]
+                    + (" (alongside %s)" % plural(n, "other task") if n else ""))
     except Exception as ex: log("ack failed:", ex)
 
 def heartbeat_once():

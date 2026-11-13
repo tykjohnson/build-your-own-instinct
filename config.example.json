@@ -17,5 +17,10 @@
   "settle_seconds": 5,
   "job_timeout_seconds": 3600,
   "max_parallel": 6,
-  "system_prompt_extra": ""
+  "system_prompt_extra": "",
+  "auto_restart_chrome": true,
+  "restart_after_seconds": 600,
+  "idle_needed_seconds": 600,
+  "after_chrome_restart": null,
+  "alert_imessage": null
 }

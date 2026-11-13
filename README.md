@@ -112,12 +112,16 @@ Text your Google Voice number `status`. You should get "Here. Nothing running." 
 1. Google Voice forwards each incoming text to your Gmail.
 2. `watcher.py` finds your real Chrome by PID and runs JavaScript in a marked Gmail tab
    through `osascript -l JavaScript`. It reads the Gmail Google Voice feed and the thread's
-   print view, so a text is caught even if Gmail already marked it read.
+   print view, so a text is caught even if Gmail already marked it read. Gmail splits one
+   Google Voice conversation into several threads over time, so it keeps watching the four
+   newest threads for your number (saved in `state.json`), not just one.
 3. Texts from numbers outside `allowed_senders` are logged and ignored.
-4. Texts that arrive within a few seconds of each other are batched into one prompt.
+4. Texts sent within a minute of each other are batched into one prompt. A backlog of texts
+   sent minutes apart (say, after the watcher was down) becomes one task per text.
    Each batch starts its own agent process in its own thread, alongside any that are
-   still running (up to `max_parallel`, default 6). The watcher acks with "on it", or
-   "on it (running alongside 2 other tasks)". Past the limit it says so and starts nothing;
+   still running (up to `max_parallel`, default 6). The watcher acks with "on it: " and the
+   first 40 characters of the task, plus "(alongside 2 other tasks)" when others are running.
+   Past the limit it says so and starts nothing;
    resend once something finishes. The prompt lists the other texts still being worked on,
    so agents don't duplicate each other's work.
 5. The answer is typed into the Google Voice web app in a second marked tab and sent. Long
@@ -150,6 +154,27 @@ Each task that runs over 10 minutes sends one "Still on it: <its text>" note.
 
 Other scripts on your Mac can text you too: drop a `.txt` file into `outbox/` and the
 watcher sends it to the first number in `allowed_senders`, then renames it to `.sent`.
+
+### When Chrome freezes
+
+A JavaScript popup (an `alert`, a `confirm`, a "Leave site?" dialog) left open in any Chrome
+tab blocks every AppleScript call to Chrome, so the watcher can neither read nor send. When
+its tab lookup times out, the watcher treats Chrome as frozen, not as missing a tab, and
+opens no new tabs. Once Chrome has been frozen for `restart_after_seconds` (default 10
+minutes):
+
+- If nobody has touched the Mac's keyboard or mouse for `idle_needed_seconds` (default 10
+  minutes) and it hasn't restarted Chrome in the last 30 minutes, it quits Chrome (a normal
+  quit, so Chrome restores its tabs; force-quit only if Chrome ignores that for 45 seconds),
+  reopens it, waits until it answers, runs your `after_chrome_restart` script if you set
+  one, and texts you that it restarted Chrome.
+- If someone is using the Mac (or `auto_restart_chrome` is `false`), it sends one alert
+  instead, through iMessage to `alert_imessage` if you set it, otherwise only to the log.
+  Quit and reopen Chrome yourself and the watcher picks up again on its own.
+
+The built-in system prompt also tells the agent to stub `window.confirm`, `window.alert` and
+`onbeforeunload` in a tab before a click that might pop a dialog, to close tabs it opens, and
+to say so if Chrome stops answering instead of retrying.
 
 To restart safely after editing the script, `touch restart.flag`. The watcher exits once no
 tasks are running and `run.sh` starts the new code.
@@ -203,6 +228,10 @@ required value is wrong.
 | `poll_seconds`, `settle_seconds`, `job_timeout_seconds` | no | Poll interval, batching window, and the per-job time limit. |
 | `max_parallel` | no | How many agent processes may run at once. Default 6. Texts past the limit are refused with a note, not queued. |
 | `system_prompt_extra` | no | Your own lines appended to the built-in system prompt (house rules, tone, tools to prefer). |
+| `auto_restart_chrome` | no | Restart Chrome when it has been frozen a while and nobody is using the Mac. Default `true`. See When Chrome freezes. |
+| `restart_after_seconds`, `idle_needed_seconds` | no | How long Chrome must be frozen, and how long the Mac must be untouched, before an auto-restart. Default 600 each. |
+| `after_chrome_restart` | no | A script to run after an auto-restart, e.g. to restart other jobs that drive Chrome. Run directly if executable, else with `bash`. Output goes to `after-restart.log`. Default none. |
+| `alert_imessage` | no | Phone number or Apple ID to iMessage (through Messages.app) when Chrome is frozen and the watcher won't restart it. Google Voice can't send while Chrome is frozen. Default none: the alert only goes to the log. The first alert makes macOS ask to let the watcher's app control Messages. |
 
 ## Gotchas
 
@@ -253,6 +282,9 @@ required value is wrong.
 - Parallel jobs share one Mac. Two tasks that edit the same files can collide; the prompt
   tells each agent what the others are doing, but nothing locks files.
 - Parallel jobs use your agent's usage limits faster.
+- Auto-restart quits your whole Chrome, not just the watcher's tabs. Chrome restores its
+  tabs, but unsaved form input and the open popup are lost. It only happens when the Mac has
+  been idle; set `"auto_restart_chrome": false` to turn it off.
 
 Run the offline tests (no Chrome, no config, no texts sent, fake agent CLIs) with
 `python3 test_watcher.py`.

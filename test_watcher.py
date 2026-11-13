@@ -109,7 +109,8 @@ def test_read_texts_still_found():
             "Me &lt;you@example.com&gt;Thu, Nov 12, 2026 at 6:21 AMTo: x\nreply\n")
     w.js = lambda code: page if "view=pt" in code else "[]"
     st = {"threads": {GV_ADDR: "abc"}, "seen": []}
-    got = w.scan(st); assert [b for b, _ in got] == ["follow up text"], got
+    got = w.scan(st); assert got == [("follow up text", "abc", "Thu, Nov 12, 2026 at 6:19 AM")], got
+    assert st["gv_hexes"] == ["abc"] and "threads" not in st, st   # old state key migrated
     assert w.scan(st) == []          # not processed twice
 
 def test_unknown_sender_ignored():
@@ -222,9 +223,9 @@ def test_parallel_jobs_each_reply():
     assert wait_for(w.idle), w.RUNNING
     acks = [r for r in replies if r.startswith("\U0001F44D")]
     answers = sorted(r for r in replies if r not in acks)
-    assert acks[0] == "\U0001F44D on it", replies
-    assert acks[1] in ("\U0001F44D on it (running alongside 1 other task)",
-                       "\U0001F44D on it"), replies          # the first may already be done
+    assert acks[0] == "\U0001F44D on it: first ask", replies
+    assert acks[1] in ("\U0001F44D on it: second ask (alongside 1 other task)",
+                       "\U0001F44D on it: second ask"), replies   # the first may already be done
     assert answers == ["claude:first ask", "claude:second ask"], replies
 
 @with_stub_send
@@ -235,7 +236,7 @@ def test_parallel_status_cap_and_stop():
         st = {}
         w.dispatch(st, "SLOW one", "h1")
         w.dispatch(st, "SLOW two", "h2")
-        assert replies == ["👍 on it", "👍 on it (running alongside 1 other task)"], replies
+        assert replies == ["👍 on it: SLOW one", "👍 on it: SLOW two (alongside 1 other task)"], replies
         assert wait_for(lambda: all(j["proc"] for j in list(w.RUNNING.values()))), w.RUNNING
         procs = [j["proc"] for j in w.RUNNING.values()]
         # the later job is told what the other one is doing
@@ -284,6 +285,196 @@ def test_max_parallel_config():
     finally:
         w.configure(base)
     assert w.MAX_PARALLEL == 6
+
+def gv_page(*texts):
+    """Print view of a GV thread: texts as (time, body), e.g. ("6:19 AM", "hi")."""
+    return "".join("(555) 555-0123 &lt;" + GV_ADDR + "&gt;Thu, Nov 12, 2026 at %s" % t
+                   + "To: me\n%s\nTo respond to this text message, reply\n" % b for t, b in texts)
+
+def test_thread_split_watches_newest_hexes():
+    # Gmail split the conversation: the feed lists the new thread first, then the old one.
+    # The new thread's text must be read (one-hex-per-address let the old one win).
+    pages = {"old": gv_page(("4:10 AM", "old text")), "new": gv_page(("4:53 AM", "new text"))}
+    feed = [{"email": GV_ADDR, "hex": "new"}, {"email": GV_ADDR, "hex": "old"}]
+    def fake_js(code):
+        if "feed/atom" in code: return json.dumps(feed)
+        return pages[code.split("th=")[1].split("'")[0]]
+    w.js = fake_js
+    st = {"seen": []}
+    got = w.scan(st)
+    assert st["gv_hexes"] == ["new", "old"], st
+    assert [(b, h) for b, h, _ in got] == [("old text", "old"), ("new text", "new")], got
+    assert w.LAST_HEX[0] == "new"
+    # later the feed only shows a third thread: the older ones stay watched, newest first
+    pages["n3"] = gv_page(("5:30 AM", "third"))
+    pages["new"] = gv_page(("4:53 AM", "new text"), ("5:31 AM", "late reply in new thread"))
+    feed[:] = [{"email": GV_ADDR, "hex": "n3"}]
+    got = w.scan(st)
+    assert st["gv_hexes"] == ["n3", "new", "old"], st
+    assert sorted(b for b, _, _ in got) == ["late reply in new thread", "third"], got
+    # only the newest few are kept
+    for h in ("n4", "n5"):
+        pages[h] = ""; feed[:] = [{"email": GV_ADDR, "hex": h}]; w.scan(st)
+    assert st["gv_hexes"] == ["n5", "n4", "n3", "new"], st
+    # other GV numbers' threads are not watched
+    feed[:] = [{"email": "15555550111.15555550123.Z@txt.voice.google.com", "hex": "x"}]
+    w.scan(st); assert "x" not in st["gv_hexes"]
+
+def test_group_texts():
+    d = "Thu, Nov 12, 2026 at %s"
+    got = [("a", "h1", d % "6:19 AM"), ("b", "h1", d % "6:20 AM"),     # 60s apart: one task
+           ("c", "h1", d % "6:25 AM"),                                   # minutes later: its own
+           ("d", "h2", d % "6:40AM"), ("e", "h2", "unparseable")]       # no space before AM; bad date joins
+    assert w.group_texts(got) == [("a\nb", "h1"), ("c", "h1"), ("d\ne", "h2")], w.group_texts(got)
+    assert w.group_texts([]) == []
+    assert w.group_texts([("x", "h", d % "11:59 PM"), ("y", "h", "Fri, Nov 13, 2026 at 12:00 AM")]) \
+        == [("x\ny", "h")]
+
+def test_ack_shows_task():
+    old = w.send_reply, w.start_job
+    acks = []
+    w.send_reply = lambda hx, t, digits=None: acks.append(t)
+    w.start_job = lambda st, body, hx: 1
+    try:
+        w.dispatch({}, "check the build on the main branch and tell me what failed\nthanks", "h")
+        assert acks == ["👍 on it: check the build on the main branch and t"], acks
+    finally:
+        w.send_reply, w.start_job = old
+
+class Stubs:
+    """Swap module attributes for one test and put them back."""
+    def __init__(self, **kw): self.kw = kw
+    def __enter__(self):
+        self.old = {}
+        for k, v in self.kw.items():
+            obj, attr = (w, k) if "." not in k else ({"os": os, "subprocess": w.subprocess}[k.split(".")[0]], k.split(".")[1])
+            self.old[(id(obj), attr)] = (obj, attr, getattr(obj, attr)); setattr(obj, attr, v)
+        return self
+    def __exit__(self, *a):
+        for obj, attr, v in self.old.values(): setattr(obj, attr, v)
+
+def reset_stuck(**kw):
+    w.STUCK.clear(); w.STUCK.update(since=0, alerted=False, restarted=0); w.STUCK.update(kw)
+
+def test_frozen_chrome_opens_no_tabs():
+    opened = []
+    def timeout(mark): raise w.subprocess.TimeoutExpired("osascript", 60)
+    reset_stuck()
+    with Stubs(find_tab=timeout, _sleep=lambda s: None, hid_idle=lambda: 0, **{"subprocess.Popen": lambda *a, **k: opened.append(a)}):
+        for _ in range(5):
+            try: w.ensure_tab()
+            except RuntimeError as ex: assert "not answering" in str(ex), ex
+            else: raise AssertionError("frozen Chrome returned a tab")
+        assert opened == [], opened
+        assert w.STUCK["since"] and not w.STUCK["alerted"]
+    # Chrome answers again: STUCK clears and the tab is used
+    with Stubs(find_tab=lambda mark: "1:2", dedupe_tabs=lambda mark: None):
+        assert w.ensure_tab() == "1:2"
+    assert w.STUCK["since"] == 0 and not w.STUCK["alerted"]
+
+def test_auto_restart_decision():
+    restarts, alerts = [], []
+    now = time.time()
+    def stuck():
+        try: w.chrome_stuck()
+        except RuntimeError as ex: return str(ex)
+        raise AssertionError("chrome_stuck must raise")
+    with Stubs(restart_chrome=lambda: restarts.append(1), stuck_alert=alerts.append, _sleep=lambda s: None):
+        # frozen 5 min: too soon for anything
+        reset_stuck(since=now - 300)
+        with Stubs(hid_idle=lambda: 9999): stuck()
+        assert restarts == [] and alerts == []
+        # frozen 11 min and nobody at the Mac: restart
+        reset_stuck(since=now - 660)
+        with Stubs(hid_idle=lambda: 9999): assert stuck() == "Chrome was restarted"
+        assert restarts == [1] and alerts == []
+        # frozen 11 min but the Mac is in use: one alert, no restart, however many polls
+        reset_stuck(since=now - 660); restarts.clear()
+        with Stubs(hid_idle=lambda: 5):
+            stuck(); stuck(); stuck()
+        assert restarts == [] and len(alerts) == 1 and "using the Mac" in alerts[0], alerts
+        # idle, but restarted 10 min ago: cooldown, alert instead of another restart
+        reset_stuck(since=now - 660, restarted=now - 600); alerts.clear()
+        with Stubs(hid_idle=lambda: 9999): stuck(); stuck()
+        assert restarts == [] and len(alerts) == 1 and "last 30 minutes" in alerts[0], alerts
+        # cooldown over: restart again
+        reset_stuck(since=now - 660, restarted=now - 1900)
+        with Stubs(hid_idle=lambda: 9999): stuck()
+        assert restarts == [1]
+        # switched off in config: alert only
+        reset_stuck(since=now - 660); restarts.clear(); alerts.clear()
+        with Stubs(AUTO_RESTART=False, hid_idle=lambda: 9999): stuck()
+        assert restarts == [] and len(alerts) == 1 and "off" in alerts[0], alerts
+    reset_stuck()
+
+def test_stuck_alert_uses_imessage_only_if_set():
+    calls = []
+    with Stubs(**{"subprocess.run": lambda argv, **k: calls.append(argv)}):
+        with Stubs(ALERT_IMESSAGE=None): w.stuck_alert("down")
+        assert calls == []
+        with Stubs(ALERT_IMESSAGE="owner@example.com"): w.stuck_alert("down")
+        assert len(calls) == 1 and calls[0][0] == "osascript" and '"owner@example.com"' in calls[0][2] \
+            and '"down"' in calls[0][2], calls
+
+def test_hid_idle_parses_ioreg():
+    class R: stdout = '  |   "HIDIdleTime" = %d\n' % (754 * 10**9)
+    with Stubs(**{"subprocess.run": lambda *a, **k: R()}):
+        assert w.hid_idle() == 754.0
+    def boom(*a, **k): raise OSError("no ioreg")
+    with Stubs(**{"subprocess.run": boom}):
+        assert w.hid_idle() == 0               # unknown counts as "in use": never restart blind
+
+def test_restart_chrome_sequence():
+    hook = FAKE / "hook.sh"; hook.write_text("echo hook\n")
+    for ignores_term in (False, True):
+        kills, popens, notes = [], [], []
+        def kill(pid, sig):
+            kills.append((pid, sig))
+            if sig == 0 and not ignores_term and len(kills) > 2: raise OSError("gone")
+        reset_stuck(since=time.time() - 700)
+        with Stubs(chrome_pid=lambda: 4242, jxa=lambda body: "1", _sleep=lambda s: None,
+                   send_reply=lambda hx, t, digits=None: notes.append(t), AFTER_RESTART=str(hook),
+                   AFTER_LOG=FAKE / "after.log",
+                   **{"os.kill": kill, "subprocess.Popen": lambda argv, **k: popens.append(argv)}):
+            assert w.restart_chrome() is True
+        sigs = [s for _, s in kills]
+        assert all(p == 4242 for p, _ in kills) and sigs[0] == w.signal.SIGTERM, kills
+        assert (w.signal.SIGKILL in sigs) == ignores_term, sigs
+        if ignores_term: assert sigs.count(0) == 45
+        assert popens == [["open", "-a", "/Applications/Google Chrome.app"], ["/bin/bash", str(hook)]], popens
+        assert w.STUCK["since"] == 0 and w.STUCK["restarted"] > 0
+        assert len(notes) == 1 and notes[0].startswith("Heads up: Chrome stopped answering"), notes
+    # Chrome never answers after relaunch: no hook, no notice, still frozen
+    popens, notes = [], []
+    reset_stuck(since=time.time() - 700)
+    def gone(pid, sig):
+        if sig == 0: raise OSError("gone")
+    def dead(body): raise RuntimeError("no answer")
+    with Stubs(chrome_pid=lambda: 4242, jxa=dead, _sleep=lambda s: None, AFTER_RESTART=str(hook),
+               send_reply=lambda hx, t, digits=None: notes.append(t),
+               **{"os.kill": gone, "subprocess.Popen": lambda argv, **k: popens.append(argv)}):
+        assert w.restart_chrome() is False
+    assert popens == [["open", "-a", "/Applications/Google Chrome.app"]] and notes == []
+    assert w.STUCK["since"] != 0
+    reset_stuck()
+
+def test_self_heal_config():
+    base = {"allowed_senders": ["5555550123"], "gv_number": "5555550100",
+            "google_account_email": "you@example.com", "agent_cmd": FAKE_CLAUDE}
+    try:
+        w.configure(base)
+        assert w.AUTO_RESTART is True and w.RESTART_AFTER == 600 and w.IDLE_NEEDED == 600
+        assert w.AFTER_RESTART is None and w.ALERT_IMESSAGE is None
+        w.configure(dict(base, auto_restart_chrome=False, restart_after_seconds=120, idle_needed_seconds=30,
+                         after_chrome_restart="~/hook.sh", alert_imessage="+1 555 555 0123"))
+        assert w.AUTO_RESTART is False and w.RESTART_AFTER == 120 and w.IDLE_NEEDED == 30
+        assert w.AFTER_RESTART == str(pathlib.Path.home() / "hook.sh") and w.ALERT_IMESSAGE == "+1 555 555 0123"
+        try: w.configure(dict(base, restart_after_seconds="soon"))
+        except w.ConfigError as ex: assert "restart_after_seconds" in str(ex)
+        else: raise AssertionError("bad restart_after_seconds accepted")
+        assert "JavaScript popup" in w.SYSTEM and "window.confirm" in w.SYSTEM
+    finally:
+        w.configure(base)
 
 for name, fn in list(globals().items()):
     if name.startswith("test_"): fn(); print("ok", name)
